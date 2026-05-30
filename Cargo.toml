@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 crossterm = "0.28"
 unicode-width = "0.2"
+arboard = "3"
