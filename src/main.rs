@@ -4,6 +4,8 @@ use std::{
     path::PathBuf,
 };
 
+use chardetng::EncodingDetector;
+
 use crossterm::{
     cursor,
     event::{
@@ -16,6 +18,117 @@ use crossterm::{
 };
 use unicode_width::UnicodeWidthChar;
 
+// ─── File encoding / line ending ─────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FileEncoding {
+    Utf8,
+    Utf8Bom,
+    ShiftJis,
+    EucJp,
+}
+
+impl FileEncoding {
+    fn label(self) -> &'static str {
+        match self {
+            FileEncoding::Utf8    => "UTF-8",
+            FileEncoding::Utf8Bom => "UTF-8 BOM",
+            FileEncoding::ShiftJis => "Shift-JIS",
+            FileEncoding::EucJp   => "EUC-JP",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LineEnding {
+    Lf,
+    Crlf,
+}
+
+impl LineEnding {
+    fn label(self) -> &'static str {
+        match self {
+            LineEnding::Lf   => "LF",
+            LineEnding::Crlf => "CRLF",
+        }
+    }
+
+    fn separator(self) -> &'static str {
+        match self {
+            LineEnding::Lf   => "\n",
+            LineEnding::Crlf => "\r\n",
+        }
+    }
+}
+
+/// Detect the character encoding of raw file bytes.
+fn detect_encoding(bytes: &[u8]) -> FileEncoding {
+    // 1. UTF-8 BOM
+    if bytes.starts_with(b"\xEF\xBB\xBF") {
+        return FileEncoding::Utf8Bom;
+    }
+    // 2. Valid UTF-8 (no BOM)
+    if std::str::from_utf8(bytes).is_ok() {
+        return FileEncoding::Utf8;
+    }
+    // 3. Use chardetng (Firefox encoding-detection algorithm) for CJK
+    let mut det = EncodingDetector::new();
+    det.feed(bytes, true);
+    let enc = det.guess(None, true);
+    if enc == encoding_rs::SHIFT_JIS {
+        FileEncoding::ShiftJis
+    } else if enc == encoding_rs::EUC_JP {
+        FileEncoding::EucJp
+    } else {
+        FileEncoding::Utf8 // fall back
+    }
+}
+
+/// Decode raw bytes to a String using the given encoding.
+fn decode_bytes(bytes: &[u8], enc: FileEncoding) -> String {
+    match enc {
+        FileEncoding::Utf8    => String::from_utf8_lossy(bytes).into_owned(),
+        FileEncoding::Utf8Bom => String::from_utf8_lossy(&bytes[3..]).into_owned(),
+        FileEncoding::ShiftJis => {
+            let (cow, _, _) = encoding_rs::SHIFT_JIS.decode(bytes);
+            cow.into_owned()
+        }
+        FileEncoding::EucJp => {
+            let (cow, _, _) = encoding_rs::EUC_JP.decode(bytes);
+            cow.into_owned()
+        }
+    }
+}
+
+/// Encode a String to bytes using the given encoding.
+fn encode_string(text: &str, enc: FileEncoding) -> Vec<u8> {
+    match enc {
+        FileEncoding::Utf8 => text.as_bytes().to_vec(),
+        FileEncoding::Utf8Bom => {
+            let mut out = b"\xEF\xBB\xBF".to_vec();
+            out.extend_from_slice(text.as_bytes());
+            out
+        }
+        FileEncoding::ShiftJis => {
+            let (cow, _, _) = encoding_rs::SHIFT_JIS.encode(text);
+            cow.into_owned()
+        }
+        FileEncoding::EucJp => {
+            let (cow, _, _) = encoding_rs::EUC_JP.encode(text);
+            cow.into_owned()
+        }
+    }
+}
+
+/// Detect the dominant line ending in a decoded string.
+fn detect_line_ending(text: &str) -> LineEnding {
+    if text.contains('\r') {
+        LineEnding::Crlf
+    } else {
+        LineEnding::Lf
+    }
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /// Visual width of a TAB character (fixed, not variable tab-stops per line).
@@ -23,22 +136,33 @@ const TAB_WIDTH: usize = 4;
 
 const HELP: &[&str] = &[
     "─── Help (Ctrl+H to close) ──────────────────────────────────────────",
-    " Ctrl+S   Save          Ctrl+W / F2   Save As      Ctrl+Z   Undo",
-    " Ctrl+C   Start/end copy selection    Ctrl+V        Paste",
-    " Ctrl+X   Start/end cut  selection    Esc           Cancel selection",
-    " Ctrl+A   Line home    Ctrl+E   Line end    Tab   Insert tab (→)",
-    " Ctrl+Q   Quit (confirms if unsaved)  Ctrl+H   Toggle this help",
-    " Arrow keys / Home / End / PageUp / PageDown   Move cursor",
+    " Ctrl+S: Save / Ctrl+W: Save As / Ctrl+Z: Undo",
+    " Ctrl+C: Start & end copy selection / Ctrl+V: Paste",
+    " Ctrl+X: Start & end cut  selection / Esc: Cancel selection",
+    " Tab: Insert tab (>) / Ctrl+E: Change encoding (UTF8,SJIS,EUC)",
+    " Ctrl+Q: Quit (confirms if unsaved) / Ctrl+H:   Toggle this help",
+    " Arrow keys / Home / End / PageUp / PageDown: Move cursor",
 ];
 const HELP_ROWS: usize = 7; // must equal HELP.len()
 
 // ─── Prompt ───────────────────────────────────────────────────────────────────
+
+/// Two-step encoding/line-ending selection driven by Ctrl+E.
+#[derive(Clone, Copy)]
+enum EncStep {
+    /// Step 1: choose a FileEncoding (keys 1-4).
+    ChooseEncoding,
+    /// Step 2: choose a LineEnding (keys L/C), carrying the encoding chosen in step 1.
+    ChooseLineEnding(FileEncoding),
+}
 
 enum Prompt {
     None,
     SaveAs { buf: Vec<char>, cur: usize },
     /// Unsaved-changes confirmation before quit.
     QuitConfirm,
+    /// Encoding / line-ending selector.
+    EncodingSelect(EncStep),
 }
 
 // ─── Undo snapshot ────────────────────────────────────────────────────────────
@@ -74,6 +198,8 @@ struct Editor {
     undo_stack: Vec<Snapshot>,
     show_help: bool,
     selection: Option<Selection>,
+    file_encoding: FileEncoding,
+    line_ending: LineEnding,
     /// Internal clipboard (also mirrors system clipboard when possible).
     clipboard: Vec<Vec<char>>,
     /// System clipboard handle — None if the OS clipboard is unavailable.
@@ -102,6 +228,8 @@ impl Editor {
             undo_stack: Vec::new(),
             show_help: false,
             selection: None,
+            file_encoding: FileEncoding::Utf8,
+            line_ending: LineEnding::Lf,
             clipboard: Vec::new(),
             sys_clipboard: arboard::Clipboard::new().ok(),
             pending_quit: false,
@@ -150,19 +278,28 @@ impl Editor {
 
     fn open(&mut self, path: PathBuf) {
         if path.exists() {
-            match fs::read_to_string(&path) {
-                Ok(content) => {
+            match fs::read(&path) {
+                Ok(bytes) => {
+                    let enc = detect_encoding(&bytes);
+                    let content = decode_bytes(&bytes, enc);
+                    let le = detect_line_ending(&content);
+                    // `str::lines()` handles both LF and CRLF transparently.
                     self.lines =
                         content.lines().map(|l| l.chars().collect()).collect();
                     if self.lines.is_empty() {
                         self.lines.push(vec![]);
                     }
+                    self.file_encoding = enc;
+                    self.line_ending = le;
                     let name = path
                         .file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned();
-                    self.status = format!("Opened: {}  |  Ctrl+S: Save / Ctrl+Q: Quit / Ctrl+H: Help", name);
+                    self.status = format!(
+                        "Opened: {}  |  Ctrl+S: Save / Ctrl+Q: Quit / Ctrl+H: Help",
+                        name
+                    );
                 }
                 Err(e) => {
                     self.status = format!("Error reading file: {}", e);
@@ -174,7 +311,10 @@ impl Editor {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
-            self.status = format!("New file: {}  |  Ctrl+S: Save / Ctrl+Q: Quit / Ctrl+H: Help", name);
+            self.status = format!(
+                "New file: {}  |  Ctrl+S: Save / Ctrl+Q: Quit / Ctrl+H: Help",
+                name
+            );
         }
         self.path = Some(path);
     }
@@ -185,8 +325,9 @@ impl Editor {
             .iter()
             .map(|l| l.iter().collect::<String>())
             .collect::<Vec<_>>()
-            .join("\n");
-        fs::write(&path, content)?;
+            .join(self.line_ending.separator());
+        let bytes = encode_string(&content, self.file_encoding);
+        fs::write(&path, bytes)?;
         self.modified = false;
         self.status = format!("Saved: {}", path.display());
         self.path = Some(path);
@@ -233,6 +374,7 @@ impl Editor {
     ) -> io::Result<bool> {
         match &self.prompt {
             Prompt::None => return Ok(false),
+            Prompt::EncodingSelect(_) => return self.handle_enc_select_key(code),
             Prompt::SaveAs { .. } | Prompt::QuitConfirm => {}
         }
 
@@ -343,9 +485,72 @@ impl Editor {
                 }
             }
 
-            Prompt::None => unreachable!(),
+            Prompt::None | Prompt::EncodingSelect(_) => unreachable!(),
         }
 
+        Ok(true)
+    }
+
+    // ── Encoding / line-ending selector ──────────────────────────────────────
+
+    fn handle_enc_select_key(&mut self, code: KeyCode) -> io::Result<bool> {
+        // Copy the step value so the borrow on self.prompt is released
+        // before we mutate it.
+        let step = match self.prompt {
+            Prompt::EncodingSelect(s) => s,
+            _ => return Ok(false),
+        };
+
+        match step {
+            EncStep::ChooseEncoding => match code {
+                KeyCode::Esc => {
+                    self.prompt = Prompt::None;
+                    self.status = "Cancelled.".into();
+                }
+                KeyCode::Char('1') => {
+                    self.prompt = Prompt::EncodingSelect(EncStep::ChooseLineEnding(FileEncoding::Utf8));
+                    self.status = "Line ending: [L] LF  [C] CRLF  Esc: Cancel".into();
+                }
+                KeyCode::Char('2') => {
+                    self.prompt = Prompt::EncodingSelect(EncStep::ChooseLineEnding(FileEncoding::Utf8Bom));
+                    self.status = "Line ending: [L] LF  [C] CRLF  Esc: Cancel".into();
+                }
+                KeyCode::Char('3') => {
+                    self.prompt = Prompt::EncodingSelect(EncStep::ChooseLineEnding(FileEncoding::ShiftJis));
+                    self.status = "Line ending: [L] LF  [C] CRLF  Esc: Cancel".into();
+                }
+                KeyCode::Char('4') => {
+                    self.prompt = Prompt::EncodingSelect(EncStep::ChooseLineEnding(FileEncoding::EucJp));
+                    self.status = "Line ending: [L] LF  [C] CRLF  Esc: Cancel".into();
+                }
+                _ => {}
+            },
+            EncStep::ChooseLineEnding(enc) => match code {
+                KeyCode::Esc => {
+                    self.prompt = Prompt::None;
+                    self.status = "Cancelled.".into();
+                }
+                KeyCode::Char('l') | KeyCode::Char('L') => {
+                    self.file_encoding = enc;
+                    self.line_ending = LineEnding::Lf;
+                    self.prompt = Prompt::None;
+                    self.status = format!(
+                        "Set to {} / LF — Ctrl+S to save.",
+                        enc.label()
+                    );
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    self.file_encoding = enc;
+                    self.line_ending = LineEnding::Crlf;
+                    self.prompt = Prompt::None;
+                    self.status = format!(
+                        "Set to {} / CRLF — Ctrl+S to save.",
+                        enc.label()
+                    );
+                }
+                _ => {}
+            },
+        }
         Ok(true)
     }
 
@@ -732,8 +937,13 @@ impl Editor {
             })
             .unwrap_or_else(|| "[New File]".into());
         let dirty = if self.modified { " [+]" } else { "" };
+        let enc_info = format!(
+            "{}  {}",
+            self.file_encoding.label(),
+            self.line_ending.label()
+        );
         let pos = format!(" {}:{} ", self.row + 1, self.col + 1);
-        let left = format!(" {}{}", file_name, dirty);
+        let left = format!(" {}{}  {}", file_name, dirty, enc_info);
         let pad = (self.term_cols as usize).saturating_sub(left.len() + pos.len());
         let status_line = format!("{}{:>pad$}{}", left, pos, "", pad = pad);
 
@@ -756,7 +966,7 @@ impl Editor {
 
         // ── Cursor position ───────────────────────────────────────────────────
         match &self.prompt {
-            Prompt::None | Prompt::QuitConfirm => {
+            Prompt::None | Prompt::QuitConfirm | Prompt::EncodingSelect(_) => {
                 let cursor_screen_row = (self.row - self.top) as u16;
                 let cursor_screen_col = self.display_col(self.row, self.col);
                 queue!(stdout, cursor::MoveTo(cursor_screen_col, cursor_screen_row))?;
@@ -842,8 +1052,7 @@ fn main() -> io::Result<()> {
                         (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
                             editor.save()?;
                         }
-                        (KeyCode::Char('w'), KeyModifiers::CONTROL)
-                        | (KeyCode::F(2), _) => {
+                        (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
                             editor.start_save_as();
                         }
 
@@ -914,12 +1123,13 @@ fn main() -> io::Result<()> {
                             editor.paste();
                         }
 
-                        // ── Line home / end ───────────────────────────────────
-                        (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
-                            editor.move_home();
-                        }
+                        // ── Encoding / line-ending selector ───────────────────
                         (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
-                            editor.move_end();
+                            editor.prompt = Prompt::EncodingSelect(EncStep::ChooseEncoding);
+                            editor.status = format!(
+                                "Encoding: [1] UTF-8  [2] UTF-8 BOM  [3] Shift-JIS  [4] EUC-JP  Esc: Cancel  (current: {})",
+                                editor.file_encoding.label()
+                            );
                         }
 
                         // ── Help toggle ───────────────────────────────────────
