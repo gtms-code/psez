@@ -1,6 +1,6 @@
 # psez
 
-Windows PowerShell および SSH（ConPTY）環境で安全に動作する、モードレスの CUI テキストエディタです。
+Windows PowerShell、コマンドプロンプト、および SSH（ConPTY）環境で安全に動作する、モードレスの CUI テキストエディタです。
 
 ## 特徴
 
@@ -8,6 +8,7 @@ Windows PowerShell および SSH（ConPTY）環境で安全に動作する、モ
 - **日本語・全角文字対応** — `unicode-width` クレートにより East Asian Width を正確に計算し、全角文字のカーソル位置を正しく管理します
 - **ConPTY クラッシュ回避** — Windows の SSH（ConPTY）環境で全角文字をバックスペース削除するとSSH接続がクラッシュする既知の問題を、フル・リドロー方式により完全に回避しています
 - **システムクリップボード連携** — コピー・カットした内容を他のアプリと共有できます
+- **文字コード・改行コード対応** — UTF-8 / UTF-8 BOM / Shift-JIS / EUC-JP、LF / CRLF を自動判別して読み書きします
 
 ## インストール
 
@@ -29,6 +30,8 @@ copy target\release\psez.exe C:\Windows\system32\
 
 ## 使い方
 
+PowerShell、コマンドプロンプト、どちらからでも起動できます。
+
 ```sh
 # 新規ファイルを作成する
 psez newfile.txt
@@ -45,14 +48,13 @@ psez
 | キー | 動作 |
 |------|------|
 | `Ctrl+S` | 上書き保存 |
-| `Ctrl+W` / `F2` | 名前を付けて保存 |
+| `Ctrl+W` | 名前を付けて保存 |
 | `Ctrl+Q` | 終了（未保存時は確認） |
 | `Ctrl+Z` | アンドゥ（最大1000回） |
 | `Ctrl+C` | コピー開始 → もう一度押して確定 |
 | `Ctrl+X` | カット開始 → もう一度押して確定 |
 | `Ctrl+V` | ペースト（システムクリップボードから） |
-| `Ctrl+A` | 行頭へ移動 |
-| `Ctrl+E` | 行末へ移動 |
+| `Ctrl+E` | 文字コード・改行コードの変更 |
 | `Ctrl+H` | ヘルプ表示 / 非表示 |
 | `Tab` | タブ文字を挿入（4カラム幅で表示） |
 | 矢印キー | カーソル移動 |
@@ -61,6 +63,15 @@ psez
 | `Backspace` / `Delete` | 文字削除 |
 | `Enter` | 改行 |
 | `Esc` | 選択のキャンセル |
+
+### 文字コード・改行コードの変更（Ctrl+E）
+
+`Ctrl+E` を押すと2ステップで変更できます。
+
+1. 文字コードを選択：`1` UTF-8 / `2` UTF-8 BOM / `3` Shift-JIS / `4` EUC-JP
+2. 改行コードを選択：`L` LF / `C` CRLF
+
+確定後、`Ctrl+S` で保存すると選択した文字コード・改行コードで書き出されます。`Esc` でいつでもキャンセルできます。
 
 ## 技術的な背景
 
@@ -79,6 +90,8 @@ psez はこの問題を **フル・リドロー方式** で解決しています
 | [`crossterm`](https://crates.io/crates/crossterm) | ターミナル制御・キーイベント取得 |
 | [`unicode-width`](https://crates.io/crates/unicode-width) | East Asian Width の正確な計算 |
 | [`arboard`](https://crates.io/crates/arboard) | システムクリップボード連携 |
+| [`encoding_rs`](https://crates.io/crates/encoding_rs) | Shift-JIS / EUC-JP のエンコード・デコード |
+| [`chardetng`](https://crates.io/crates/chardetng) | 文字コードの自動判別 |
 
 ## ライセンス
 
