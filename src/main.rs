@@ -1,7 +1,7 @@
 use std::{
     env, fs,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use chardetng::EncodingDetector;
@@ -129,6 +129,20 @@ fn detect_line_ending(text: &str) -> LineEnding {
     }
 }
 
+// ─── Safety limits ────────────────────────────────────────────────────────────
+
+/// Hard limit for file size: refuse to open files larger than this.
+const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
+
+/// Total memory budget for the undo stack (across all snapshots).
+const UNDO_MEM_CAP: usize = 64 * 1024 * 1024; // 64 MB
+
+/// Approximate heap bytes used by one undo snapshot.
+/// Each `char` in Rust is 4 bytes; we ignore Vec overhead as a minor constant.
+fn snapshot_mem(snap: &Snapshot) -> usize {
+    snap.lines.iter().map(|l| l.len() * 4).sum()
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /// Visual width of a TAB character (fixed, not variable tab-stops per line).
@@ -163,6 +177,8 @@ enum Prompt {
     QuitConfirm,
     /// Encoding / line-ending selector.
     EncodingSelect(EncStep),
+    /// Symlink-overwrite confirmation.
+    SymlinkConfirm(PathBuf),
 }
 
 // ─── Undo snapshot ────────────────────────────────────────────────────────────
@@ -196,6 +212,8 @@ struct Editor {
     status: String,
     prompt: Prompt,
     undo_stack: Vec<Snapshot>,
+    /// Running total of undo stack memory (bytes).
+    undo_total_mem: usize,
     show_help: bool,
     selection: Option<Selection>,
     file_encoding: FileEncoding,
@@ -226,6 +244,7 @@ impl Editor {
             ),
             prompt: Prompt::None,
             undo_stack: Vec::new(),
+            undo_total_mem: 0,
             show_help: false,
             selection: None,
             file_encoding: FileEncoding::Utf8,
@@ -245,18 +264,25 @@ impl Editor {
     // ── Undo ─────────────────────────────────────────────────────────────────
 
     fn push_undo(&mut self) {
-        self.undo_stack.push(Snapshot {
+        let snap = Snapshot {
             lines: self.lines.clone(),
             row: self.row,
             col: self.col,
-        });
-        if self.undo_stack.len() > 1000 {
-            self.undo_stack.remove(0);
+        };
+        self.undo_total_mem += snapshot_mem(&snap);
+        self.undo_stack.push(snap);
+        // Evict oldest entries until total memory is within the cap.
+        while self.undo_total_mem > UNDO_MEM_CAP && self.undo_stack.len() > 1 {
+            let evicted = self.undo_stack.remove(0);
+            self.undo_total_mem =
+                self.undo_total_mem.saturating_sub(snapshot_mem(&evicted));
         }
     }
 
     fn undo(&mut self) {
         if let Some(snap) = self.undo_stack.pop() {
+            self.undo_total_mem =
+                self.undo_total_mem.saturating_sub(snapshot_mem(&snap));
             self.lines = snap.lines;
             self.row = snap.row;
             self.col = snap.col;
@@ -278,6 +304,17 @@ impl Editor {
 
     fn open(&mut self, path: PathBuf) {
         if path.exists() {
+            // Refuse to open files that exceed the hard size limit.
+            if let Ok(meta) = fs::metadata(&path) {
+                if meta.len() > MAX_FILE_BYTES {
+                    self.status = format!(
+                        "Error: file too large ({} MB). Limit is {} MB.",
+                        meta.len() / 1024 / 1024,
+                        MAX_FILE_BYTES / 1024 / 1024
+                    );
+                    return;
+                }
+            }
             match fs::read(&path) {
                 Ok(bytes) => {
                     let enc = detect_encoding(&bytes);
@@ -320,6 +357,25 @@ impl Editor {
     }
 
     fn save_to(&mut self, path: PathBuf) -> io::Result<()> {
+        // Symlink check: if the path is a symlink, ask for confirmation
+        // before potentially overwriting a file the user didn't intend to touch.
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                self.status = format!(
+                    "\"{}\" is a symlink. Save to target anyway? [Y]es / [N]o",
+                    path.display()
+                );
+                self.prompt = Prompt::SymlinkConfirm(path);
+                return Ok(());
+            }
+            _ => {}
+        }
+        self.write_file(path)
+    }
+
+    /// Atomically write the buffer to `path` (temp file → fsync → rename).
+    /// Does NOT perform a symlink check; call `save_to` instead.
+    fn write_file(&mut self, path: PathBuf) -> io::Result<()> {
         let content: String = self
             .lines
             .iter()
@@ -327,11 +383,19 @@ impl Editor {
             .collect::<Vec<_>>()
             .join(self.line_ending.separator());
         let bytes = encode_string(&content, self.file_encoding);
-        fs::write(&path, bytes)?;
+
+        // Write to a temporary file in the same directory so that the
+        // rename is on the same filesystem and therefore atomic.
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        tmp.write_all(&bytes)?;
+        tmp.flush()?;
+        tmp.as_file().sync_all()?; // fsync
+        tmp.persist(&path).map_err(|e| e.error)?; // atomic rename
+
         self.modified = false;
         self.status = format!("Saved: {}", path.display());
         self.path = Some(path);
-        // If a quit was requested before save, complete the quit now.
         if self.quit_after_save {
             self.quit_after_save = false;
             self.pending_quit = true;
@@ -375,6 +439,7 @@ impl Editor {
         match &self.prompt {
             Prompt::None => return Ok(false),
             Prompt::EncodingSelect(_) => return self.handle_enc_select_key(code),
+            Prompt::SymlinkConfirm(_) => return self.handle_symlink_confirm_key(code),
             Prompt::SaveAs { .. } | Prompt::QuitConfirm => {}
         }
 
@@ -485,9 +550,32 @@ impl Editor {
                 }
             }
 
-            Prompt::None | Prompt::EncodingSelect(_) => unreachable!(),
+            Prompt::None | Prompt::EncodingSelect(_) | Prompt::SymlinkConfirm(_) => {
+                unreachable!()
+            }
         }
 
+        Ok(true)
+    }
+
+    // ── Symlink overwrite confirmation ────────────────────────────────────────
+
+    fn handle_symlink_confirm_key(&mut self, code: KeyCode) -> io::Result<bool> {
+        let path = match &self.prompt {
+            Prompt::SymlinkConfirm(p) => p.clone(),
+            _ => return Ok(false),
+        };
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.prompt = Prompt::None;
+                self.write_file(path)?;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.prompt = Prompt::None;
+                self.status = "Save cancelled.".into();
+            }
+            _ => {}
+        }
         Ok(true)
     }
 
@@ -966,7 +1054,10 @@ impl Editor {
 
         // ── Cursor position ───────────────────────────────────────────────────
         match &self.prompt {
-            Prompt::None | Prompt::QuitConfirm | Prompt::EncodingSelect(_) => {
+            Prompt::None
+            | Prompt::QuitConfirm
+            | Prompt::EncodingSelect(_)
+            | Prompt::SymlinkConfirm(_) => {
                 let cursor_screen_row = (self.row - self.top) as u16;
                 let cursor_screen_col = self.display_col(self.row, self.col);
                 queue!(stdout, cursor::MoveTo(cursor_screen_col, cursor_screen_row))?;
