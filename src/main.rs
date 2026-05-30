@@ -6,7 +6,10 @@ use std::{
 
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute, queue,
     style::Print,
     terminal::{self, ClearType},
@@ -17,11 +20,11 @@ use unicode_width::UnicodeWidthChar;
 
 const HELP: &[&str] = &[
     "─── Help (Ctrl+H to close) ──────────────────────────────────────",
-    " Ctrl+S        Save               Ctrl+Shift+S   Save As",
-    " Ctrl+Q        Quit               Ctrl+Z         Undo",
-    " Ctrl+A        Line beginning     Ctrl+E         Line end",
-    " Arrow keys    Move cursor        Home / End     Line home / end",
-    " PageUp/Down   Scroll page        Ctrl+H         Toggle this help",
+    " Ctrl+S        Save               Ctrl+W / F2    Save As",
+    " Ctrl+Q        Quit               Ctrl+Z              Undo",
+    " Ctrl+A        Line beginning     Ctrl+E              Line end",
+    " Arrow keys    Move cursor        Home / End          Line home / end",
+    " PageUp/Down   Scroll page        Ctrl+H              Toggle this help",
 ];
 
 const HELP_ROWS: usize = 6; // must equal HELP.len()
@@ -69,7 +72,7 @@ impl Editor {
             term_rows,
             path: None,
             modified: false,
-            status: String::from("Ctrl+S: Save  Ctrl+Shift+S: Save As  Ctrl+H: Help  Ctrl+Q: Quit"),
+            status: String::from("Ctrl+S: Save  Ctrl+W/F2: Save As  Ctrl+H: Help  Ctrl+Q: Quit"),
             prompt: Prompt::None,
             undo_stack: Vec::new(),
             show_help: false,
@@ -472,6 +475,16 @@ fn main() -> io::Result<()> {
     terminal::enable_raw_mode()?;
     execute!(stdout, terminal::EnterAlternateScreen, cursor::Show)?;
 
+    // Enable the Kitty keyboard enhancement protocol where supported so that
+    // modifier combinations like Ctrl+Shift+S are reported unambiguously.
+    let keyboard_enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if keyboard_enhanced {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+
     let (cols, rows) = terminal::size()?;
     let mut editor = Editor::new(cols, rows);
 
@@ -503,14 +516,9 @@ fn main() -> io::Result<()> {
                         (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
                             editor.save()?;
                         }
-                        // Ctrl+Shift+S: terminals may send uppercase 'S' with CONTROL,
-                        // or lowercase 's' with CONTROL|SHIFT — handle both.
-                        (KeyCode::Char('S'), KeyModifiers::CONTROL) => {
-                            editor.start_save_as();
-                        }
-                        (KeyCode::Char('s'), m)
-                            if m == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
-                        {
+                        // ── Save As ───────────────────────────────────────────
+                        (KeyCode::Char('w'), KeyModifiers::CONTROL)
+                        | (KeyCode::F(2), _) => {
                             editor.start_save_as();
                         }
 
@@ -565,6 +573,9 @@ fn main() -> io::Result<()> {
         editor.render(&mut stdout)?;
     }
 
+    if keyboard_enhanced {
+        execute!(stdout, PopKeyboardEnhancementFlags)?;
+    }
     execute!(stdout, terminal::LeaveAlternateScreen)?;
     terminal::disable_raw_mode()?;
 
