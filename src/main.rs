@@ -154,7 +154,7 @@ const HELP: &[&str] = &[
     " Ctrl+C: Start & end copy selection / Ctrl+V: Paste",
     " Ctrl+X: Start & end cut  selection / Esc: Cancel selection",
     " Tab: Insert tab (>) / Ctrl+E: Change encoding (UTF8,SJIS,EUC)",
-    " Ctrl+Q: Quit (confirms if unsaved) / Ctrl+H:   Toggle this help",
+    " Ctrl+F: Toggle word wrap / Ctrl+Q: Quit / Ctrl+H: Toggle this help",
     " Arrow keys / Home / End / PageUp / PageDown: Move cursor",
 ];
 const HELP_ROWS: usize = 7; // must equal HELP.len()
@@ -205,6 +205,10 @@ struct Editor {
     row: usize,
     col: usize,
     top: usize,
+    /// First visible display column (horizontal scroll offset, 0 in wrap mode).
+    left: usize,
+    /// Word-wrap display mode toggle.
+    word_wrap: bool,
     term_cols: u16,
     term_rows: u16,
     path: Option<PathBuf>,
@@ -235,6 +239,8 @@ impl Editor {
             row: 0,
             col: 0,
             top: 0,
+            left: 0,
+            word_wrap: false,
             term_cols,
             term_rows,
             path: None,
@@ -783,6 +789,154 @@ impl Editor {
         x as u16
     }
 
+    /// Total display width of a logical line (tab-aware).
+    /// Step the wrap-layout state machine by one character.
+    /// `col_x` = column within current visual row, `vis_row` = visual row index.
+    /// Returns updated (vis_row, col_x) after the character is consumed.
+    fn wrap_step(tw: usize, logical_x: usize, col_x: usize, vis_row: usize, ch: char) -> (usize, usize) {
+        let is_tab = ch == '\t';
+        let w = if is_tab {
+            TAB_WIDTH - (logical_x % TAB_WIDTH)
+        } else {
+            ch.width().unwrap_or(0)
+        };
+        let avail = tw.saturating_sub(col_x);
+        if !is_tab && avail > 0 && avail < w {
+            // Wide char moved to next visual row.
+            (vis_row + 1, w)
+        } else if col_x + w >= tw {
+            let overflow = col_x + w - tw;
+            if overflow == 0 {
+                (vis_row + 1, 0)
+            } else {
+                (vis_row + 1, overflow)
+            }
+        } else {
+            (vis_row, col_x + w)
+        }
+    }
+
+    /// How many visual rows `row` occupies in word-wrap mode.
+    /// Uses the same state machine as the renderer so heights are consistent.
+    fn visual_height(&self, row: usize) -> usize {
+        if !self.word_wrap { return 1; }
+        let tw = self.term_cols as usize;
+        if tw == 0 { return 1; }
+        let mut vis_row = 0usize;
+        let mut col_x = 0usize;
+        let mut logical_x = 0usize;
+        for ch in &self.lines[row] {
+            let (vr, cx) = Self::wrap_step(tw, logical_x, col_x, vis_row, *ch);
+            logical_x += if *ch == '\t' { TAB_WIDTH - (logical_x % TAB_WIDTH) } else { ch.width().unwrap_or(0) };
+            vis_row = vr;
+            col_x = cx;
+        }
+        vis_row + 1
+    }
+
+    /// Visual (vis_row_in_line, col_x) where the character at `col` will be
+    /// rendered in word-wrap mode.  Accounts for wide chars being moved to the
+    /// next visual row rather than split across the boundary.
+    fn wrap_render_pos(&self, row: usize, col: usize) -> (usize, usize) {
+        let tw = self.term_cols as usize;
+        if tw == 0 { return (0, 0); }
+        let mut vis_row = 0usize;
+        let mut col_x = 0usize;
+        let mut logical_x = 0usize;
+        for ch in &self.lines[row][..col.min(self.lines[row].len())] {
+            let w = if *ch == '\t' { TAB_WIDTH - (logical_x % TAB_WIDTH) } else { ch.width().unwrap_or(0) };
+            let (vr, cx) = Self::wrap_step(tw, logical_x, col_x, vis_row, *ch);
+            logical_x += w;
+            vis_row = vr;
+            col_x = cx;
+        }
+        // If the character AT col is a wide char that won't fit, it moves to
+        // the next visual row — place the cursor there.
+        if col < self.lines[row].len() {
+            let ch = self.lines[row][col];
+            if ch != '\t' {
+                let w = ch.width().unwrap_or(0);
+                let avail = tw.saturating_sub(col_x);
+                if avail > 0 && avail < w {
+                    return (vis_row + 1, 0);
+                }
+            }
+        }
+        (vis_row, col_x)
+    }
+
+    /// Scroll adjustment for word-wrap mode: ensure the cursor is visible.
+    fn adjust_scroll_wrap(&mut self) {
+        let text_rows = self.text_rows();
+        if self.row < self.top {
+            self.top = self.row;
+            return;
+        }
+        loop {
+            let rows_before: usize =
+                (self.top..self.row).map(|r| self.visual_height(r)).sum();
+            let (cursor_vis, _) = self.wrap_render_pos(self.row, self.col);
+            if rows_before + cursor_vis < text_rows { break; }
+            if self.top >= self.row { break; }
+            self.top += 1;
+        }
+    }
+
+    /// Largest character-boundary display column that is ≤ `target`.
+    /// Used when scrolling LEFT to ensure `left` never splits a wide character.
+    fn char_boundary_le(&self, row: usize, target: usize) -> usize {
+        let mut x = 0usize;
+        for ch in &self.lines[row] {
+            let w = if *ch == '\t' {
+                TAB_WIDTH - (x % TAB_WIDTH)
+            } else {
+                ch.width().unwrap_or(0)
+            };
+            if x + w > target {
+                return x;
+            }
+            x += w;
+        }
+        x
+    }
+
+    /// Smallest character-boundary display column that is ≥ `target`.
+    /// Used when scrolling RIGHT so that a wide character straddling the
+    /// boundary doesn't keep `left` stuck at the previous position.
+    fn char_boundary_ge(&self, row: usize, target: usize) -> usize {
+        let mut x = 0usize;
+        for ch in &self.lines[row] {
+            let w = if *ch == '\t' {
+                TAB_WIDTH - (x % TAB_WIDTH)
+            } else {
+                ch.width().unwrap_or(0)
+            };
+            if x >= target {
+                return x;
+            }
+            x += w;
+        }
+        x
+    }
+
+    /// Adjust scroll offsets so the cursor is always visible on screen.
+    pub fn adjust_left(&mut self) {
+        if self.word_wrap {
+            self.left = 0;
+            self.adjust_scroll_wrap();
+            return;
+        }
+        let cursor_disp = self.display_col(self.row, self.col) as usize;
+        let screen_w = self.term_cols as usize;
+        if screen_w == 0 { return; }
+        if cursor_disp < self.left {
+            self.left = self.char_boundary_le(self.row, cursor_disp);
+        } else if cursor_disp >= self.left + screen_w {
+            let min_left = cursor_disp.saturating_sub(screen_w - 1);
+            self.left = self.char_boundary_ge(self.row, min_left);
+        }
+    }
+
     // ── Editing operations ────────────────────────────────────────────────────
 
     fn insert_char(&mut self, ch: char) {
@@ -930,70 +1084,217 @@ impl Editor {
         let text_rows = self.text_rows();
 
         // ── Text area ─────────────────────────────────────────────────────────
-        for screen_row in 0..text_rows {
-            let doc_row = self.top + screen_row;
-            queue!(
-                stdout,
-                cursor::MoveTo(0, screen_row as u16),
-                terminal::Clear(ClearType::CurrentLine)
-            )?;
+        if self.word_wrap {
+            // ── Word-wrap mode ───────────────────────────────────────────────
+            // Uses the same state machine as wrap_render_pos / visual_height.
+            // Wide chars (non-tab) that don't fit on the current visual row are
+            // moved entirely to the NEXT row (current row padded with a space),
+            // so they are never split and are always fully visible.
+            let tw = self.term_cols as usize;
+            let mut screen_row = 0usize;
+            let mut doc_row = self.top;
 
-            if doc_row < self.lines.len() {
-                let mut display_x: usize = 0;
-                // Track current render attribute state to minimise escape spam.
-                // State: (is_selected, is_tab)
+            while screen_row < text_rows {
+                if doc_row >= self.lines.len() {
+                    queue!(
+                        stdout,
+                        cursor::MoveTo(0, screen_row as u16),
+                        terminal::Clear(ClearType::CurrentLine),
+                        Print('~')
+                    )?;
+                    screen_row += 1;
+                    continue;
+                }
+
+                let mut logical_x = 0usize; // for tab-width computation
+                let mut vis_row = 0usize;   // visual sub-row within this logical line
+                let mut col_x = 0usize;     // column within the current visual row
                 let mut cur_attr: (bool, bool) = (false, false);
 
+                // Macro-like helper: advance to the next visual row.
+                macro_rules! next_vis_row {
+                    ($stdout:expr) => {{
+                        if cur_attr != (false, false) {
+                            queue!($stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
+                            cur_attr = (false, false);
+                        }
+                        vis_row += 1;
+                        col_x = 0;
+                        if screen_row + vis_row < text_rows {
+                            queue!(
+                                $stdout,
+                                cursor::MoveTo(0, (screen_row + vis_row) as u16),
+                                terminal::Clear(ClearType::CurrentLine)
+                            )?;
+                        }
+                    }};
+                }
+
+                queue!(
+                    stdout,
+                    cursor::MoveTo(0, screen_row as u16),
+                    terminal::Clear(ClearType::CurrentLine)
+                )?;
+
                 for (char_idx, ch) in self.lines[doc_row].iter().enumerate() {
+                    if screen_row + vis_row >= text_rows { break; }
+
                     let is_tab = *ch == '\t';
                     let w = if is_tab {
-                        TAB_WIDTH - (display_x % TAB_WIDTH)
+                        TAB_WIDTH - (logical_x % TAB_WIDTH)
                     } else {
                         ch.width().unwrap_or(0)
                     };
+                    logical_x += w;
 
-                    if display_x + w > self.term_cols as usize {
-                        break;
-                    }
+                    let avail = tw.saturating_sub(col_x);
 
-                    let sel = self.in_selection(doc_row, char_idx);
-                    let new_attr = (sel, is_tab);
-
-                    if new_attr != cur_attr {
-                        // Reset all attributes/colors, then re-apply as needed.
-                        queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
-                        if sel {
-                            queue!(stdout, Print(crossterm::style::SetAttribute(Attribute::Reverse)))?;
+                    if !is_tab && avail > 0 && avail < w {
+                        // ── Wide char doesn't fit: pad → move to next row ─────
+                        let sel = self.in_selection(doc_row, char_idx);
+                        let na = (sel, false);
+                        if na != cur_attr {
+                            queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
+                            if sel { queue!(stdout, Print(crossterm::style::SetAttribute(Attribute::Reverse)))?; }
+                            cur_attr = na;
                         }
-                        if is_tab {
-                            // DarkGrey is reliably rendered as a dimmer color in
-                            // Windows Terminal and most other modern terminals.
-                            queue!(stdout, SetForegroundColor(Color::DarkGrey))?;
+                        // Pad the rest of this row with spaces.
+                        for _ in 0..avail { queue!(stdout, Print(' '))?; }
+                        next_vis_row!(stdout);
+                        if screen_row + vis_row < text_rows {
+                            // Render the wide char on the new row.
+                            let sel2 = self.in_selection(doc_row, char_idx);
+                            let na2 = (sel2, false);
+                            if na2 != cur_attr {
+                                queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
+                                if sel2 { queue!(stdout, Print(crossterm::style::SetAttribute(Attribute::Reverse)))?; }
+                                cur_attr = na2;
+                            }
+                            queue!(stdout, Print(ch))?;
+                            col_x = w;
                         }
-                        cur_attr = new_attr;
-                    }
-
-                    if is_tab {
-                        // '>' is ASCII (always 1 column), safe on all terminals.
-                        // U+2192 → is East-Asian-Ambiguous and renders as 2 cols
-                        // in CJK terminals, which would break cursor alignment.
-                        queue!(stdout, Print('>'))?;
-                        for _ in 1..w {
-                            queue!(stdout, Print(' '))?;
+                    } else if col_x + w > tw {
+                        // ── Tab (or overflow) spans boundary: split as spaces ──
+                        let fits = avail;
+                        let overflow = w - fits;
+                        let sel = self.in_selection(doc_row, char_idx);
+                        let na = (sel, false);
+                        if na != cur_attr {
+                            queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
+                            if sel { queue!(stdout, Print(crossterm::style::SetAttribute(Attribute::Reverse)))?; }
+                            cur_attr = na;
+                        }
+                        for _ in 0..fits { queue!(stdout, Print(' '))?; }
+                        next_vis_row!(stdout);
+                        if screen_row + vis_row < text_rows {
+                            let sel2 = self.in_selection(doc_row, char_idx);
+                            if sel2 {
+                                queue!(stdout, Print(crossterm::style::SetAttribute(Attribute::Reverse)))?;
+                                cur_attr = (true, false);
+                            }
+                            for _ in 0..overflow { queue!(stdout, Print(' '))?; }
+                            col_x = overflow;
                         }
                     } else {
-                        queue!(stdout, Print(ch))?;
+                        // ── Normal: render in place ────────────────────────────
+                        let sel = self.in_selection(doc_row, char_idx);
+                        let na = (sel, is_tab);
+                        if na != cur_attr {
+                            queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
+                            if sel { queue!(stdout, Print(crossterm::style::SetAttribute(Attribute::Reverse)))?; }
+                            if is_tab { queue!(stdout, SetForegroundColor(Color::DarkGrey))?; }
+                            cur_attr = na;
+                        }
+                        if is_tab {
+                            queue!(stdout, Print('>'))?;
+                            for _ in 1..w { queue!(stdout, Print(' '))?; }
+                        } else {
+                            queue!(stdout, Print(ch))?;
+                        }
+                        col_x += w;
+                        // Exact boundary: clear next row eagerly for a tidy display.
+                        if col_x == tw {
+                            next_vis_row!(stdout);
+                        }
                     }
-
-                    display_x += w;
                 }
 
-                // Always reset color/attributes at end of line.
                 if cur_attr != (false, false) {
                     queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
                 }
-            } else {
-                queue!(stdout, Print('~'))?;
+
+                screen_row += vis_row + 1;
+                doc_row += 1;
+            }
+        } else {
+            // ── Horizontal-scroll mode (original) ────────────────────────────
+            for screen_row in 0..text_rows {
+                let doc_row = self.top + screen_row;
+                queue!(
+                    stdout,
+                    cursor::MoveTo(0, screen_row as u16),
+                    terminal::Clear(ClearType::CurrentLine)
+                )?;
+
+                if doc_row < self.lines.len() {
+                    let mut display_x: usize = 0;
+                    let screen_w = self.term_cols as usize;
+                    let mut cur_attr: (bool, bool) = (false, false);
+
+                    for (char_idx, ch) in self.lines[doc_row].iter().enumerate() {
+                        let is_tab = *ch == '\t';
+                        let w = if is_tab {
+                            TAB_WIDTH - (display_x % TAB_WIDTH)
+                        } else {
+                            ch.width().unwrap_or(0)
+                        };
+
+                        if display_x + w <= self.left {
+                            display_x += w;
+                            continue;
+                        }
+                        if display_x < self.left {
+                            let visible_w = (display_x + w - self.left).min(screen_w);
+                            let sel = self.in_selection(doc_row, char_idx);
+                            let new_attr = (sel, false);
+                            if new_attr != cur_attr {
+                                queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
+                                if sel { queue!(stdout, Print(crossterm::style::SetAttribute(Attribute::Reverse)))?; }
+                                cur_attr = new_attr;
+                            }
+                            for _ in 0..visible_w { queue!(stdout, Print(' '))?; }
+                            display_x += w;
+                            continue;
+                        }
+                        let screen_x = display_x - self.left;
+                        if screen_x >= screen_w { break; }
+                        let avail = screen_w - screen_x;
+
+                        let sel = self.in_selection(doc_row, char_idx);
+                        let new_attr = (sel, is_tab);
+                        if new_attr != cur_attr {
+                            queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
+                            if sel { queue!(stdout, Print(crossterm::style::SetAttribute(Attribute::Reverse)))?; }
+                            if is_tab { queue!(stdout, SetForegroundColor(Color::DarkGrey))?; }
+                            cur_attr = new_attr;
+                        }
+                        if is_tab {
+                            let print_w = w.min(avail);
+                            queue!(stdout, Print('>'))?;
+                            for _ in 1..print_w { queue!(stdout, Print(' '))?; }
+                        } else if w > avail {
+                            for _ in 0..avail { queue!(stdout, Print(' '))?; }
+                        } else {
+                            queue!(stdout, Print(ch))?;
+                        }
+                        display_x += w;
+                    }
+                    if cur_attr != (false, false) {
+                        queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
+                    }
+                } else {
+                    queue!(stdout, Print('~'))?;
+                }
             }
         }
 
@@ -1058,9 +1359,22 @@ impl Editor {
             | Prompt::QuitConfirm
             | Prompt::EncodingSelect(_)
             | Prompt::SymlinkConfirm(_) => {
-                let cursor_screen_row = (self.row - self.top) as u16;
-                let cursor_screen_col = self.display_col(self.row, self.col);
-                queue!(stdout, cursor::MoveTo(cursor_screen_col, cursor_screen_row))?;
+                let cursor_disp = self.display_col(self.row, self.col) as usize;
+                let (cursor_screen_row, cursor_screen_col) = if self.word_wrap {
+                    let rows_before: usize =
+                        (self.top..self.row).map(|r| self.visual_height(r)).sum();
+                    let (vrow, vcol) = self.wrap_render_pos(self.row, self.col);
+                    (rows_before + vrow, vcol)
+                } else {
+                    (
+                        self.row - self.top,
+                        cursor_disp.saturating_sub(self.left),
+                    )
+                };
+                queue!(
+                    stdout,
+                    cursor::MoveTo(cursor_screen_col as u16, cursor_screen_row as u16)
+                )?;
             }
             Prompt::SaveAs { buf, cur } => {
                 let prefix_len = "Save as: ".len() as u16;
@@ -1107,6 +1421,7 @@ fn main() -> io::Result<()> {
         editor.open(p);
     }
 
+    editor.adjust_left();
     editor.render(&mut stdout)?;
 
     'main: loop {
@@ -1223,6 +1538,17 @@ fn main() -> io::Result<()> {
                             );
                         }
 
+                        // ── Word wrap toggle ──────────────────────────────────
+                        (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                            editor.word_wrap = !editor.word_wrap;
+                            editor.left = 0;
+                            editor.status = if editor.word_wrap {
+                                "Word wrap: ON".into()
+                            } else {
+                                "Word wrap: OFF".into()
+                            };
+                        }
+
                         // ── Help toggle ───────────────────────────────────────
                         (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
                             editor.show_help = !editor.show_help;
@@ -1267,6 +1593,7 @@ fn main() -> io::Result<()> {
             _ => {}
         }
 
+        editor.adjust_left();
         editor.render(&mut stdout)?;
     }
 
