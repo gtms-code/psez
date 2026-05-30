@@ -132,7 +132,7 @@ fn detect_line_ending(text: &str) -> LineEnding {
 // ─── Safety limits ────────────────────────────────────────────────────────────
 
 /// Hard limit for file size: refuse to open files larger than this.
-const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
+const MAX_FILE_BYTES: u64 = 500 * 1024 * 1024; // 500 MB
 
 /// Total memory budget for the undo stack (across all snapshots).
 const UNDO_MEM_CAP: usize = 64 * 1024 * 1024; // 64 MB
