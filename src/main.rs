@@ -96,7 +96,7 @@ impl Editor {
             path: None,
             modified: false,
             status: String::from(
-                "Ctrl+S: Save  Ctrl+W/F2: Save As  Ctrl+H: Help  Ctrl+Q: Quit",
+                "Ctrl+S: Save / Ctrl+Q: Quit / Ctrl+H: Help"
             ),
             prompt: Prompt::None,
             undo_stack: Vec::new(),
@@ -162,7 +162,7 @@ impl Editor {
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned();
-                    self.status = format!("Opened: {}  |  Ctrl+H: Help", name);
+                    self.status = format!("Opened: {}  |  Ctrl+S: Save / Ctrl+Q: Quit / Ctrl+H: Help", name);
                 }
                 Err(e) => {
                     self.status = format!("Error reading file: {}", e);
@@ -174,7 +174,7 @@ impl Editor {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
-            self.status = format!("New file: {}  |  Ctrl+H: Help", name);
+            self.status = format!("New file: {}  |  Ctrl+S: Save / Ctrl+Q: Quit / Ctrl+H: Help", name);
         }
         self.path = Some(path);
     }
