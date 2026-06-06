@@ -115,6 +115,10 @@ psez はこの問題を **フル・リドロー方式** で解決しています
 | [`chardetng`](https://crates.io/crates/chardetng) | 文字コードの自動判別 |
 | [`tempfile`](https://crates.io/crates/tempfile) | アトミックなファイル保存 |
 
+## 免責事項
+
+本ソフトウェアは現状のまま（AS IS）提供されます。使用は自己責任でお願いします。ファイルの破損・データの損失・その他いかなる損害が生じた場合も、作者は一切の責任を負いません。大切なファイルを編集する前には必ずバックアップを取ることを強くお勧めします。
+
 ## ライセンス
 
 [GNU General Public License v3.0](LICENSE)
