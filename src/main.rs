@@ -13,7 +13,7 @@ use crossterm::{
         KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute, queue,
-    style::{Attribute, Color, Print, ResetColor, SetForegroundColor},
+    style::{Attribute, Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{self, ClearType},
 };
 use unicode_width::UnicodeWidthChar;
@@ -63,15 +63,12 @@ impl LineEnding {
 
 /// Detect the character encoding of raw file bytes.
 fn detect_encoding(bytes: &[u8]) -> FileEncoding {
-    // 1. UTF-8 BOM
     if bytes.starts_with(b"\xEF\xBB\xBF") {
         return FileEncoding::Utf8Bom;
     }
-    // 2. Valid UTF-8 (no BOM)
     if std::str::from_utf8(bytes).is_ok() {
         return FileEncoding::Utf8;
     }
-    // 3. Use chardetng (Firefox encoding-detection algorithm) for CJK
     let mut det = EncodingDetector::new();
     det.feed(bytes, true);
     let enc = det.guess(None, true);
@@ -80,7 +77,7 @@ fn detect_encoding(bytes: &[u8]) -> FileEncoding {
     } else if enc == encoding_rs::EUC_JP {
         FileEncoding::EucJp
     } else {
-        FileEncoding::Utf8 // fall back
+        FileEncoding::Utf8
     }
 }
 
@@ -131,54 +128,61 @@ fn detect_line_ending(text: &str) -> LineEnding {
 
 // ─── Safety limits ────────────────────────────────────────────────────────────
 
-/// Hard limit for file size: refuse to open files larger than this.
 const MAX_FILE_BYTES: u64 = 500 * 1024 * 1024; // 500 MB
+const UNDO_MEM_CAP: usize = 64 * 1024 * 1024;  // 64 MB
 
-/// Total memory budget for the undo stack (across all snapshots).
-const UNDO_MEM_CAP: usize = 64 * 1024 * 1024; // 64 MB
-
-/// Approximate heap bytes used by one undo snapshot.
-/// Each `char` in Rust is 4 bytes; we ignore Vec overhead as a minor constant.
 fn snapshot_mem(snap: &Snapshot) -> usize {
     snap.lines.iter().map(|l| l.len() * 4).sum()
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-/// Visual width of a TAB character (fixed, not variable tab-stops per line).
 const TAB_WIDTH: usize = 4;
 
 const HELP: &[&str] = &[
     "─── Help (Ctrl+H to close) ──────────────────────────────────────────",
-    " Ctrl+S: Save / Ctrl+W: Save As / Ctrl+Z: Undo",
+    " Ctrl+S: Save / Ctrl+W: Save As / Ctrl+Z: Undo / Ctrl+A: Select All",
     " Ctrl+C: Start & end copy selection / Ctrl+V: Paste",
     " Ctrl+X: Start & end cut  selection / Esc: Cancel selection",
     " Tab: Insert tab (>) / Ctrl+E: Change encoding (UTF8,SJIS,EUC)",
-    " Ctrl+F: Toggle word wrap / Ctrl+Q: Quit / Ctrl+H: Toggle this help",
+    " Ctrl+F: Search / Ctrl+R: Replace all / Ctrl+B: Toggle word wrap",
+    " Ctrl+Q: Quit / Ctrl+H: Toggle this help",
     " Arrow keys / Home / End / PageUp / PageDown: Move cursor",
 ];
-const HELP_ROWS: usize = 7; // must equal HELP.len()
+const HELP_ROWS: usize = 8; // must equal HELP.len()
 
-// ─── Prompt ───────────────────────────────────────────────────────────────────
+// ─── ReplaceStep ──────────────────────────────────────────────────────────────
 
-/// Two-step encoding/line-ending selection driven by Ctrl+E.
+#[derive(Clone, Copy)]
+enum ReplaceStep {
+    SearchInput,
+    ReplaceInput,
+}
+
+// ─── EncStep ──────────────────────────────────────────────────────────────────
+
 #[derive(Clone, Copy)]
 enum EncStep {
-    /// Step 1: choose a FileEncoding (keys 1-4).
     ChooseEncoding,
-    /// Step 2: choose a LineEnding (keys L/C), carrying the encoding chosen in step 1.
     ChooseLineEnding(FileEncoding),
 }
+
+// ─── Prompt ───────────────────────────────────────────────────────────────────
 
 enum Prompt {
     None,
     SaveAs { buf: Vec<char>, cur: usize },
-    /// Unsaved-changes confirmation before quit.
     QuitConfirm,
-    /// Encoding / line-ending selector.
     EncodingSelect(EncStep),
-    /// Symlink-overwrite confirmation.
     SymlinkConfirm(PathBuf),
+    Search { buf: Vec<char>, cur: usize },
+    Replace {
+        search_buf: Vec<char>,
+        replace_buf: Vec<char>,
+        search_cur: usize,
+        replace_cur: usize,
+        step: ReplaceStep,
+    },
 }
 
 // ─── Undo snapshot ────────────────────────────────────────────────────────────
@@ -194,7 +198,6 @@ struct Snapshot {
 struct Selection {
     anchor_row: usize,
     anchor_col: usize,
-    /// true = Ctrl+X (cut), false = Ctrl+C (copy)
     is_cut: bool,
 }
 
@@ -205,9 +208,7 @@ struct Editor {
     row: usize,
     col: usize,
     top: usize,
-    /// First visible display column (horizontal scroll offset, 0 in wrap mode).
     left: usize,
-    /// Word-wrap display mode toggle.
     word_wrap: bool,
     term_cols: u16,
     term_rows: u16,
@@ -216,20 +217,19 @@ struct Editor {
     status: String,
     prompt: Prompt,
     undo_stack: Vec<Snapshot>,
-    /// Running total of undo stack memory (bytes).
     undo_total_mem: usize,
     show_help: bool,
     selection: Option<Selection>,
     file_encoding: FileEncoding,
     line_ending: LineEnding,
-    /// Internal clipboard (also mirrors system clipboard when possible).
     clipboard: Vec<Vec<char>>,
-    /// System clipboard handle — None if the OS clipboard is unavailable.
     sys_clipboard: Option<arboard::Clipboard>,
-    /// When true the main loop should break after the next render.
     pending_quit: bool,
-    /// When true, a successful save should set pending_quit.
     quit_after_save: bool,
+    // Search / replace state
+    search_query: Vec<char>,
+    search_matches: Vec<(usize, usize)>, // (row, char_col) of each match start
+    search_match_idx: usize,             // index of the currently highlighted match
 }
 
 impl Editor {
@@ -245,9 +245,7 @@ impl Editor {
             term_rows,
             path: None,
             modified: false,
-            status: String::from(
-                "Ctrl+S: Save / Ctrl+Q: Quit / Ctrl+H: Help"
-            ),
+            status: String::from("Ctrl+S: Save / Ctrl+Q: Quit / Ctrl+H: Help"),
             prompt: Prompt::None,
             undo_stack: Vec::new(),
             undo_total_mem: 0,
@@ -259,6 +257,9 @@ impl Editor {
             sys_clipboard: arboard::Clipboard::new().ok(),
             pending_quit: false,
             quit_after_save: false,
+            search_query: Vec::new(),
+            search_matches: Vec::new(),
+            search_match_idx: 0,
         }
     }
 
@@ -277,7 +278,6 @@ impl Editor {
         };
         self.undo_total_mem += snapshot_mem(&snap);
         self.undo_stack.push(snap);
-        // Evict oldest entries until total memory is within the cap.
         while self.undo_total_mem > UNDO_MEM_CAP && self.undo_stack.len() > 1 {
             let evicted = self.undo_stack.remove(0);
             self.undo_total_mem =
@@ -310,7 +310,6 @@ impl Editor {
 
     fn open(&mut self, path: PathBuf) {
         if path.exists() {
-            // Refuse to open files that exceed the hard size limit.
             if let Ok(meta) = fs::metadata(&path) {
                 if meta.len() > MAX_FILE_BYTES {
                     self.status = format!(
@@ -326,7 +325,6 @@ impl Editor {
                     let enc = detect_encoding(&bytes);
                     let content = decode_bytes(&bytes, enc);
                     let le = detect_line_ending(&content);
-                    // `str::lines()` handles both LF and CRLF transparently.
                     self.lines =
                         content.lines().map(|l| l.chars().collect()).collect();
                     if self.lines.is_empty() {
@@ -363,8 +361,6 @@ impl Editor {
     }
 
     fn save_to(&mut self, path: PathBuf) -> io::Result<()> {
-        // Symlink check: if the path is a symlink, ask for confirmation
-        // before potentially overwriting a file the user didn't intend to touch.
         match fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 self.status = format!(
@@ -379,8 +375,6 @@ impl Editor {
         self.write_file(path)
     }
 
-    /// Atomically write the buffer to `path` (temp file → fsync → rename).
-    /// Does NOT perform a symlink check; call `save_to` instead.
     fn write_file(&mut self, path: PathBuf) -> io::Result<()> {
         let content: String = self
             .lines
@@ -390,14 +384,12 @@ impl Editor {
             .join(self.line_ending.separator());
         let bytes = encode_string(&content, self.file_encoding);
 
-        // Write to a temporary file in the same directory so that the
-        // rename is on the same filesystem and therefore atomic.
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
         tmp.write_all(&bytes)?;
         tmp.flush()?;
-        tmp.as_file().sync_all()?; // fsync
-        tmp.persist(&path).map_err(|e| e.error)?; // atomic rename
+        tmp.as_file().sync_all()?;
+        tmp.persist(&path).map_err(|e| e.error)?;
 
         self.modified = false;
         self.status = format!("Saved: {}", path.display());
@@ -434,9 +426,115 @@ impl Editor {
         self.prompt = Prompt::SaveAs { buf: prefill, cur };
     }
 
+    // ── Search / replace helpers ──────────────────────────────────────────────
+
+    /// Recompute all match positions for the current search_query.
+    fn update_search(&mut self) {
+        self.search_matches.clear();
+        if self.search_query.is_empty() { return; }
+        let qlen = self.search_query.len();
+        for (r, line) in self.lines.iter().enumerate() {
+            if line.len() < qlen { continue; }
+            let limit = line.len() - qlen + 1;
+            for c in 0..limit {
+                if line[c..c + qlen] == self.search_query[..] {
+                    self.search_matches.push((r, c));
+                }
+            }
+        }
+        if !self.search_matches.is_empty() {
+            self.search_match_idx =
+                self.search_match_idx.min(self.search_matches.len() - 1);
+        } else {
+            self.search_match_idx = 0;
+        }
+    }
+
+    /// Index of the first match at or after (row, col); wraps to 0.
+    fn find_nearest_match_from(&self, row: usize, col: usize) -> usize {
+        for (i, &(r, c)) in self.search_matches.iter().enumerate() {
+            if (r, c) >= (row, col) { return i; }
+        }
+        0
+    }
+
+    /// Scroll so the current match is visible and move the cursor there.
+    fn jump_to_match(&mut self, idx: usize) {
+        if self.search_matches.is_empty() { return; }
+        let idx = idx % self.search_matches.len();
+        self.search_match_idx = idx;
+        let (r, c) = self.search_matches[idx];
+        self.row = r;
+        self.col = c;
+        let tr = self.text_rows();
+        if self.row < self.top { self.top = self.row; }
+        if self.row >= self.top + tr {
+            self.top = self.row.saturating_sub(tr / 2);
+        }
+    }
+
+    /// Search highlight level for a character: 0=none, 1=match, 2=current match.
+    fn search_attr_at(&self, row: usize, col: usize) -> u8 {
+        if self.search_query.is_empty() { return 0; }
+        let qlen = self.search_query.len();
+        for (i, &(mr, mc)) in self.search_matches.iter().enumerate() {
+            if mr == row && col >= mc && col < mc + qlen {
+                return if i == self.search_match_idx { 2 } else { 1 };
+            }
+        }
+        0
+    }
+
+    /// Select the entire document.
+    fn select_all(&mut self) {
+        self.selection = Some(Selection {
+            anchor_row: 0,
+            anchor_col: 0,
+            is_cut: false,
+        });
+        self.row = self.lines.len() - 1;
+        self.col = self.lines[self.row].len();
+        self.status = "Selected all.".into();
+    }
+
+    /// Replace every match of search_query with `replace`.
+    fn replace_all(&mut self, replace: &[char]) {
+        let count = self.search_matches.len();
+        if count == 0 {
+            self.status = "No matches to replace.".into();
+            return;
+        }
+        self.push_undo();
+        let qlen = self.search_query.len();
+        // Process in reverse so earlier indices stay valid.
+        for &(r, c) in self.search_matches.iter().rev() {
+            if c + qlen <= self.lines[r].len() {
+                self.lines[r].splice(c..c + qlen, replace.iter().cloned());
+            }
+        }
+        self.modified = true;
+        self.status = format!("Replaced {} occurrence(s).", count);
+    }
+
+    /// Helper: update search status string.
+    fn search_status(&self) -> String {
+        let q: String = self.search_query.iter().collect();
+        if q.is_empty() {
+            "Search: ".into()
+        } else if self.search_matches.is_empty() {
+            format!("Search: {}  (not found)", q)
+        } else {
+            format!(
+                "Search: {}  [{}/{}]  Enter=next  Esc=close",
+                q,
+                self.search_match_idx + 1,
+                self.search_matches.len()
+            )
+        }
+    }
+
     // ── Prompt handling ───────────────────────────────────────────────────────
 
-    /// Returns true if the prompt consumed the key.
     fn handle_prompt_key(
         &mut self,
         code: KeyCode,
@@ -446,11 +544,12 @@ impl Editor {
             Prompt::None => return Ok(false),
             Prompt::EncodingSelect(_) => return self.handle_enc_select_key(code),
             Prompt::SymlinkConfirm(_) => return self.handle_symlink_confirm_key(code),
+            Prompt::Search { .. } => return self.handle_search_key(code, modifiers),
+            Prompt::Replace { .. } => return self.handle_replace_key(code, modifiers),
             Prompt::SaveAs { .. } | Prompt::QuitConfirm => {}
         }
 
         match &self.prompt {
-            // ── QuitConfirm ───────────────────────────────────────────────────
             Prompt::QuitConfirm => {
                 match code {
                     KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -461,13 +560,12 @@ impl Editor {
                                 self.pending_quit = true;
                             }
                             None => {
-                                // Need filename first; quit after save completes.
                                 self.quit_after_save = true;
                                 self.start_save_as();
                             }
                         }
                     }
-                    KeyCode::Char('n') | KeyCode::Char('N') => {
+                    KeyCode::Char('u') | KeyCode::Char('U') => {
                         self.prompt = Prompt::None;
                         self.pending_quit = true;
                     }
@@ -475,11 +573,10 @@ impl Editor {
                         self.prompt = Prompt::None;
                         self.status = "Quit cancelled.".into();
                     }
-                    _ => {} // ignore other keys while confirming
+                    _ => {}
                 }
             }
 
-            // ── SaveAs ────────────────────────────────────────────────────────
             Prompt::SaveAs { .. } => {
                 match code {
                     KeyCode::Esc => {
@@ -507,9 +604,7 @@ impl Editor {
                     }
                     KeyCode::Right => {
                         if let Prompt::SaveAs { ref buf, ref mut cur } = self.prompt {
-                            if *cur < buf.len() {
-                                *cur += 1;
-                            }
+                            if *cur < buf.len() { *cur += 1; }
                         }
                     }
                     KeyCode::Home => {
@@ -556,12 +651,303 @@ impl Editor {
                 }
             }
 
-            Prompt::None | Prompt::EncodingSelect(_) | Prompt::SymlinkConfirm(_) => {
-                unreachable!()
-            }
+            Prompt::None
+            | Prompt::EncodingSelect(_)
+            | Prompt::SymlinkConfirm(_)
+            | Prompt::Search { .. }
+            | Prompt::Replace { .. } => unreachable!(),
         }
 
         Ok(true)
+    }
+
+    // ── Search prompt ─────────────────────────────────────────────────────────
+
+    fn handle_search_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> io::Result<bool> {
+        match code {
+            KeyCode::Esc => {
+                self.prompt = Prompt::None;
+                self.search_query.clear();
+                self.search_matches.clear();
+                self.status = "Ctrl+S: Save / Ctrl+Q: Quit / Ctrl+H: Help".into();
+                return Ok(true);
+            }
+            KeyCode::Enter => {
+                if !self.search_matches.is_empty() {
+                    let next = (self.search_match_idx + 1) % self.search_matches.len();
+                    self.jump_to_match(next);
+                }
+                self.status = self.search_status();
+                return Ok(true);
+            }
+            _ => {}
+        }
+
+        // Text editing in the search buffer
+        let changed = match code {
+            KeyCode::Backspace => {
+                let (changed, new_q) = if let Prompt::Search { ref mut buf, ref mut cur } = self.prompt {
+                    if *cur > 0 {
+                        *cur -= 1;
+                        buf.remove(*cur);
+                        (true, buf.clone())
+                    } else { (false, buf.clone()) }
+                } else { (false, vec![]) };
+                if changed { self.search_query = new_q; }
+                changed
+            }
+            KeyCode::Delete => {
+                let (changed, new_q) = if let Prompt::Search { ref mut buf, ref cur } = self.prompt {
+                    let c = *cur;
+                    if c < buf.len() {
+                        buf.remove(c);
+                        (true, buf.clone())
+                    } else { (false, buf.clone()) }
+                } else { (false, vec![]) };
+                if changed { self.search_query = new_q; }
+                changed
+            }
+            KeyCode::Left => {
+                if let Prompt::Search { ref mut cur, .. } = self.prompt {
+                    *cur = cur.saturating_sub(1);
+                }
+                false
+            }
+            KeyCode::Right => {
+                if let Prompt::Search { ref buf, ref mut cur } = self.prompt {
+                    if *cur < buf.len() { *cur += 1; }
+                }
+                false
+            }
+            KeyCode::Home => {
+                if let Prompt::Search { ref mut cur, .. } = self.prompt {
+                    *cur = 0;
+                }
+                false
+            }
+            KeyCode::End => {
+                if let Prompt::Search { ref buf, ref mut cur } = self.prompt {
+                    *cur = buf.len();
+                }
+                false
+            }
+            KeyCode::Char(c)
+                if modifiers == KeyModifiers::NONE || modifiers == KeyModifiers::SHIFT =>
+            {
+                let (changed, new_q) = if let Prompt::Search { ref mut buf, ref mut cur } = self.prompt {
+                    buf.insert(*cur, c);
+                    *cur += 1;
+                    (true, buf.clone())
+                } else { (false, vec![]) };
+                if changed { self.search_query = new_q; }
+                changed
+            }
+            _ => false,
+        };
+
+        if changed {
+            self.update_search();
+            if !self.search_matches.is_empty() {
+                let idx = self.find_nearest_match_from(self.row, self.col);
+                self.jump_to_match(idx);
+            }
+        }
+        self.status = self.search_status();
+        Ok(true)
+    }
+
+    // ── Replace prompt ────────────────────────────────────────────────────────
+
+    fn handle_replace_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> io::Result<bool> {
+        let step = match &self.prompt {
+            Prompt::Replace { step, .. } => *step as u8,
+            _ => return Ok(false),
+        };
+        // step: 0 = SearchInput, 1 = ReplaceInput
+
+        if step == 0 {
+            // ── Step 1: editing the search query ─────────────────────────────
+            match code {
+                KeyCode::Esc => {
+                    self.prompt = Prompt::None;
+                    self.search_query.clear();
+                    self.search_matches.clear();
+                    self.status = "Ctrl+S: Save / Ctrl+Q: Quit / Ctrl+H: Help".into();
+                    return Ok(true);
+                }
+                KeyCode::Enter => {
+                    // Move to replace-string step
+                    if let Prompt::Replace { ref mut step, ref mut replace_cur, .. } = self.prompt {
+                        *step = ReplaceStep::ReplaceInput;
+                        *replace_cur = 0;
+                    }
+                    self.update_replace_status();
+                    return Ok(true);
+                }
+                _ => {}
+            }
+
+            let changed = match code {
+                KeyCode::Backspace => {
+                    let (changed, new_q) = if let Prompt::Replace { ref mut search_buf, ref mut search_cur, .. } = self.prompt {
+                        if *search_cur > 0 {
+                            *search_cur -= 1;
+                            search_buf.remove(*search_cur);
+                            (true, search_buf.clone())
+                        } else { (false, search_buf.clone()) }
+                    } else { (false, vec![]) };
+                    if changed { self.search_query = new_q; }
+                    changed
+                }
+                KeyCode::Delete => {
+                    let (changed, new_q) = if let Prompt::Replace { ref mut search_buf, ref search_cur, .. } = self.prompt {
+                        let c = *search_cur;
+                        if c < search_buf.len() {
+                            search_buf.remove(c);
+                            (true, search_buf.clone())
+                        } else { (false, search_buf.clone()) }
+                    } else { (false, vec![]) };
+                    if changed { self.search_query = new_q; }
+                    changed
+                }
+                KeyCode::Left => {
+                    if let Prompt::Replace { ref mut search_cur, .. } = self.prompt {
+                        *search_cur = search_cur.saturating_sub(1);
+                    }
+                    false
+                }
+                KeyCode::Right => {
+                    if let Prompt::Replace { ref search_buf, ref mut search_cur, .. } = self.prompt {
+                        if *search_cur < search_buf.len() { *search_cur += 1; }
+                    }
+                    false
+                }
+                KeyCode::Home => {
+                    if let Prompt::Replace { ref mut search_cur, .. } = self.prompt { *search_cur = 0; }
+                    false
+                }
+                KeyCode::End => {
+                    if let Prompt::Replace { ref search_buf, ref mut search_cur, .. } = self.prompt {
+                        *search_cur = search_buf.len();
+                    }
+                    false
+                }
+                KeyCode::Char(c)
+                    if modifiers == KeyModifiers::NONE || modifiers == KeyModifiers::SHIFT =>
+                {
+                    let (changed, new_q) = if let Prompt::Replace { ref mut search_buf, ref mut search_cur, .. } = self.prompt {
+                        search_buf.insert(*search_cur, c);
+                        *search_cur += 1;
+                        (true, search_buf.clone())
+                    } else { (false, vec![]) };
+                    if changed { self.search_query = new_q; }
+                    changed
+                }
+                _ => false,
+            };
+
+            if changed {
+                self.update_search();
+                if !self.search_matches.is_empty() {
+                    let idx = self.find_nearest_match_from(self.row, self.col);
+                    self.search_match_idx = idx;
+                }
+            }
+            self.update_replace_status();
+        } else {
+            // ── Step 2: editing the replacement string ────────────────────────
+            match code {
+                KeyCode::Esc => {
+                    self.prompt = Prompt::None;
+                    self.search_query.clear();
+                    self.search_matches.clear();
+                    self.status = "Ctrl+S: Save / Ctrl+Q: Quit / Ctrl+H: Help".into();
+                    return Ok(true);
+                }
+                KeyCode::Enter => {
+                    let replace_buf = if let Prompt::Replace { ref replace_buf, .. } = self.prompt {
+                        replace_buf.clone()
+                    } else { vec![] };
+                    self.replace_all(&replace_buf);
+                    self.prompt = Prompt::None;
+                    self.search_query.clear();
+                    self.search_matches.clear();
+                    return Ok(true);
+                }
+                _ => {}
+            }
+
+            match code {
+                KeyCode::Backspace => {
+                    if let Prompt::Replace { ref mut replace_buf, ref mut replace_cur, .. } = self.prompt {
+                        if *replace_cur > 0 {
+                            *replace_cur -= 1;
+                            replace_buf.remove(*replace_cur);
+                        }
+                    }
+                }
+                KeyCode::Delete => {
+                    if let Prompt::Replace { ref mut replace_buf, ref replace_cur, .. } = self.prompt {
+                        let c = *replace_cur;
+                        if c < replace_buf.len() { replace_buf.remove(c); }
+                    }
+                }
+                KeyCode::Left => {
+                    if let Prompt::Replace { ref mut replace_cur, .. } = self.prompt {
+                        *replace_cur = replace_cur.saturating_sub(1);
+                    }
+                }
+                KeyCode::Right => {
+                    if let Prompt::Replace { ref replace_buf, ref mut replace_cur, .. } = self.prompt {
+                        if *replace_cur < replace_buf.len() { *replace_cur += 1; }
+                    }
+                }
+                KeyCode::Home => {
+                    if let Prompt::Replace { ref mut replace_cur, .. } = self.prompt { *replace_cur = 0; }
+                }
+                KeyCode::End => {
+                    if let Prompt::Replace { ref replace_buf, ref mut replace_cur, .. } = self.prompt {
+                        *replace_cur = replace_buf.len();
+                    }
+                }
+                KeyCode::Char(c)
+                    if modifiers == KeyModifiers::NONE || modifiers == KeyModifiers::SHIFT =>
+                {
+                    if let Prompt::Replace { ref mut replace_buf, ref mut replace_cur, .. } = self.prompt {
+                        replace_buf.insert(*replace_cur, c);
+                        *replace_cur += 1;
+                    }
+                }
+                _ => {}
+            }
+            self.update_replace_status();
+        }
+
+        Ok(true)
+    }
+
+    fn update_replace_status(&mut self) {
+        let (q, r_str, count, step_num) = match &self.prompt {
+            Prompt::Replace { search_buf, replace_buf, step, .. } => {
+                let q: String = search_buf.iter().collect();
+                let r: String = replace_buf.iter().collect();
+                let count = self.search_matches.len();
+                let s = match step { ReplaceStep::SearchInput => 0u8, ReplaceStep::ReplaceInput => 1u8 };
+                (q, r, count, s)
+            }
+            _ => return,
+        };
+        if step_num == 0 {
+            if q.is_empty() {
+                self.status = "Replace — Search: ".into();
+            } else if count == 0 {
+                self.status = format!("Replace — Search: {}  (not found)  Enter=next  Esc=cancel", q);
+            } else {
+                self.status = format!("Replace — Search: {}  [{} found]  Enter=next  Esc=cancel", q, count);
+            }
+        } else {
+            self.status = format!("Replace \"{}\" with: {}", q, r_str);
+        }
     }
 
     // ── Symlink overwrite confirmation ────────────────────────────────────────
@@ -588,8 +974,6 @@ impl Editor {
     // ── Encoding / line-ending selector ──────────────────────────────────────
 
     fn handle_enc_select_key(&mut self, code: KeyCode) -> io::Result<bool> {
-        // Copy the step value so the borrow on self.prompt is released
-        // before we mutate it.
         let step = match self.prompt {
             Prompt::EncodingSelect(s) => s,
             _ => return Ok(false),
@@ -628,19 +1012,13 @@ impl Editor {
                     self.file_encoding = enc;
                     self.line_ending = LineEnding::Lf;
                     self.prompt = Prompt::None;
-                    self.status = format!(
-                        "Set to {} / LF — Ctrl+S to save.",
-                        enc.label()
-                    );
+                    self.status = format!("Set to {} / LF — Ctrl+S to save.", enc.label());
                 }
                 KeyCode::Char('c') | KeyCode::Char('C') => {
                     self.file_encoding = enc;
                     self.line_ending = LineEnding::Crlf;
                     self.prompt = Prompt::None;
-                    self.status = format!(
-                        "Set to {} / CRLF — Ctrl+S to save.",
-                        enc.label()
-                    );
+                    self.status = format!("Set to {} / CRLF — Ctrl+S to save.", enc.label());
                 }
                 _ => {}
             },
@@ -650,7 +1028,6 @@ impl Editor {
 
     // ── Selection / clipboard ─────────────────────────────────────────────────
 
-    /// Normalized (start, end) as (row, col) tuples; end is exclusive.
     fn selection_range(&self) -> Option<((usize, usize), (usize, usize))> {
         let sel = self.selection.as_ref()?;
         let anchor = (sel.anchor_row, sel.anchor_col);
@@ -706,7 +1083,6 @@ impl Editor {
         }
     }
 
-    /// Convert internal clipboard to a plain string for the system clipboard.
     fn clipboard_to_string(&self) -> String {
         self.clipboard
             .iter()
@@ -715,7 +1091,6 @@ impl Editor {
             .join("\n")
     }
 
-    /// Write the current internal clipboard to the system clipboard.
     fn sync_to_sys_clipboard(&mut self) {
         let text = self.clipboard_to_string();
         if let Some(ref mut cb) = self.sys_clipboard {
@@ -723,27 +1098,20 @@ impl Editor {
         }
     }
 
-    /// Paste at cursor from system clipboard (if available), else internal.
     fn paste(&mut self) {
-        // Read system clipboard; update internal clipboard if successful.
         let sys_text = self
             .sys_clipboard
             .as_mut()
             .and_then(|cb| cb.get_text().ok());
 
         if let Some(text) = sys_text {
-            self.clipboard = text
-                .lines()
-                .map(|l| l.chars().collect())
-                .collect();
+            self.clipboard = text.lines().map(|l| l.chars().collect()).collect();
             if self.clipboard.is_empty() {
                 self.clipboard.push(vec![]);
             }
         }
 
-        if self.clipboard.is_empty() {
-            return;
-        }
+        if self.clipboard.is_empty() { return; }
         self.push_undo();
 
         if self.clipboard.len() == 1 {
@@ -776,7 +1144,6 @@ impl Editor {
 
     // ── Cursor / display helpers ──────────────────────────────────────────────
 
-    /// Display column of logical cursor position, handling TAB expansion.
     fn display_col(&self, row: usize, col: usize) -> u16 {
         let mut x: usize = 0;
         for ch in &self.lines[row][..col] {
@@ -789,10 +1156,6 @@ impl Editor {
         x as u16
     }
 
-    /// Total display width of a logical line (tab-aware).
-    /// Step the wrap-layout state machine by one character.
-    /// `col_x` = column within current visual row, `vis_row` = visual row index.
-    /// Returns updated (vis_row, col_x) after the character is consumed.
     fn wrap_step(tw: usize, logical_x: usize, col_x: usize, vis_row: usize, ch: char) -> (usize, usize) {
         let is_tab = ch == '\t';
         let w = if is_tab {
@@ -802,22 +1165,15 @@ impl Editor {
         };
         let avail = tw.saturating_sub(col_x);
         if !is_tab && avail > 0 && avail < w {
-            // Wide char moved to next visual row.
             (vis_row + 1, w)
         } else if col_x + w >= tw {
             let overflow = col_x + w - tw;
-            if overflow == 0 {
-                (vis_row + 1, 0)
-            } else {
-                (vis_row + 1, overflow)
-            }
+            if overflow == 0 { (vis_row + 1, 0) } else { (vis_row + 1, overflow) }
         } else {
             (vis_row, col_x + w)
         }
     }
 
-    /// How many visual rows `row` occupies in word-wrap mode.
-    /// Uses the same state machine as the renderer so heights are consistent.
     fn visual_height(&self, row: usize) -> usize {
         if !self.word_wrap { return 1; }
         let tw = self.term_cols as usize;
@@ -834,9 +1190,6 @@ impl Editor {
         vis_row + 1
     }
 
-    /// Visual (vis_row_in_line, col_x) where the character at `col` will be
-    /// rendered in word-wrap mode.  Accounts for wide chars being moved to the
-    /// next visual row rather than split across the boundary.
     fn wrap_render_pos(&self, row: usize, col: usize) -> (usize, usize) {
         let tw = self.term_cols as usize;
         if tw == 0 { return (0, 0); }
@@ -850,8 +1203,6 @@ impl Editor {
             vis_row = vr;
             col_x = cx;
         }
-        // If the character AT col is a wide char that won't fit, it moves to
-        // the next visual row — place the cursor there.
         if col < self.lines[row].len() {
             let ch = self.lines[row][col];
             if ch != '\t' {
@@ -865,7 +1216,6 @@ impl Editor {
         (vis_row, col_x)
     }
 
-    /// Scroll adjustment for word-wrap mode: ensure the cursor is visible.
     fn adjust_scroll_wrap(&mut self) {
         let text_rows = self.text_rows();
         if self.row < self.top {
@@ -882,8 +1232,6 @@ impl Editor {
         }
     }
 
-    /// Largest character-boundary display column that is ≤ `target`.
-    /// Used when scrolling LEFT to ensure `left` never splits a wide character.
     fn char_boundary_le(&self, row: usize, target: usize) -> usize {
         let mut x = 0usize;
         for ch in &self.lines[row] {
@@ -892,17 +1240,12 @@ impl Editor {
             } else {
                 ch.width().unwrap_or(0)
             };
-            if x + w > target {
-                return x;
-            }
+            if x + w > target { return x; }
             x += w;
         }
         x
     }
 
-    /// Smallest character-boundary display column that is ≥ `target`.
-    /// Used when scrolling RIGHT so that a wide character straddling the
-    /// boundary doesn't keep `left` stuck at the previous position.
     fn char_boundary_ge(&self, row: usize, target: usize) -> usize {
         let mut x = 0usize;
         for ch in &self.lines[row] {
@@ -911,15 +1254,12 @@ impl Editor {
             } else {
                 ch.width().unwrap_or(0)
             };
-            if x >= target {
-                return x;
-            }
+            if x >= target { return x; }
             x += w;
         }
         x
     }
 
-    /// Adjust scroll offsets so the cursor is always visible on screen.
     pub fn adjust_left(&mut self) {
         if self.word_wrap {
             self.left = 0;
@@ -970,9 +1310,7 @@ impl Editor {
 
     fn backspace(&mut self) {
         self.selection = None;
-        if self.col > 0 || self.row > 0 {
-            self.push_undo();
-        }
+        if self.col > 0 || self.row > 0 { self.push_undo(); }
         if self.col > 0 {
             self.col -= 1;
             self.lines[self.row].remove(self.col);
@@ -983,9 +1321,7 @@ impl Editor {
             self.col = self.lines[self.row].len();
             self.lines[self.row].extend(current);
             self.modified = true;
-            if self.top > self.row {
-                self.top = self.row;
-            }
+            if self.top > self.row { self.top = self.row; }
         }
     }
 
@@ -993,9 +1329,7 @@ impl Editor {
         self.selection = None;
         let line_len = self.lines[self.row].len();
         let can_delete = self.col < line_len || self.row + 1 < self.lines.len();
-        if can_delete {
-            self.push_undo();
-        }
+        if can_delete { self.push_undo(); }
         if self.col < line_len {
             self.lines[self.row].remove(self.col);
             self.modified = true;
@@ -1012,9 +1346,7 @@ impl Editor {
         if self.row > 0 {
             self.row -= 1;
             self.col = self.col.min(self.lines[self.row].len());
-            if self.row < self.top {
-                self.top = self.row;
-            }
+            if self.row < self.top { self.top = self.row; }
         }
     }
 
@@ -1022,9 +1354,7 @@ impl Editor {
         if self.row + 1 < self.lines.len() {
             self.row += 1;
             self.col = self.col.min(self.lines[self.row].len());
-            if self.row >= self.top + self.text_rows() {
-                self.top += 1;
-            }
+            if self.row >= self.top + self.text_rows() { self.top += 1; }
         }
     }
 
@@ -1034,9 +1364,7 @@ impl Editor {
         } else if self.row > 0 {
             self.row -= 1;
             self.col = self.lines[self.row].len();
-            if self.row < self.top {
-                self.top = self.row;
-            }
+            if self.row < self.top { self.top = self.row; }
         }
     }
 
@@ -1047,19 +1375,12 @@ impl Editor {
         } else if self.row + 1 < self.lines.len() {
             self.row += 1;
             self.col = 0;
-            if self.row >= self.top + self.text_rows() {
-                self.top += 1;
-            }
+            if self.row >= self.top + self.text_rows() { self.top += 1; }
         }
     }
 
-    fn move_home(&mut self) {
-        self.col = 0;
-    }
-
-    fn move_end(&mut self) {
-        self.col = self.lines[self.row].len();
-    }
+    fn move_home(&mut self) { self.col = 0; }
+    fn move_end(&mut self) { self.col = self.lines[self.row].len(); }
 
     fn page_up(&mut self) {
         let tr = self.text_rows();
@@ -1083,13 +1404,35 @@ impl Editor {
 
         let text_rows = self.text_rows();
 
+        // cur_attr: (selected, is_tab, search_level)
+        // search_level: 0=none, 1=match, 2=current match
+        type Attr = (bool, bool, u8);
+        let reset_attr: Attr = (false, false, 0);
+
+        // Helper: emit escape sequences for attribute transition
+        macro_rules! apply_attr {
+            ($stdout:expr, $cur:expr, $new:expr) => {{
+                let new: Attr = $new;
+                if new != *$cur {
+                    queue!($stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
+                    let (sel, tab, srch) = new;
+                    if sel {
+                        queue!($stdout, Print(crossterm::style::SetAttribute(Attribute::Reverse)))?;
+                    } else if srch == 2 {
+                        queue!($stdout, SetBackgroundColor(Color::Yellow), SetForegroundColor(Color::Black))?;
+                    } else if srch == 1 {
+                        queue!($stdout, SetBackgroundColor(Color::DarkYellow), SetForegroundColor(Color::Black))?;
+                    }
+                    if tab && !sel && srch == 0 {
+                        queue!($stdout, SetForegroundColor(Color::DarkGrey))?;
+                    }
+                    *$cur = new;
+                }
+            }};
+        }
+
         // ── Text area ─────────────────────────────────────────────────────────
         if self.word_wrap {
-            // ── Word-wrap mode ───────────────────────────────────────────────
-            // Uses the same state machine as wrap_render_pos / visual_height.
-            // Wide chars (non-tab) that don't fit on the current visual row are
-            // moved entirely to the NEXT row (current row padded with a space),
-            // so they are never split and are always fully visible.
             let tw = self.term_cols as usize;
             let mut screen_row = 0usize;
             let mut doc_row = self.top;
@@ -1106,17 +1449,16 @@ impl Editor {
                     continue;
                 }
 
-                let mut logical_x = 0usize; // for tab-width computation
-                let mut vis_row = 0usize;   // visual sub-row within this logical line
-                let mut col_x = 0usize;     // column within the current visual row
-                let mut cur_attr: (bool, bool) = (false, false);
+                let mut logical_x = 0usize;
+                let mut vis_row = 0usize;
+                let mut col_x = 0usize;
+                let mut cur_attr: Attr = reset_attr;
 
-                // Macro-like helper: advance to the next visual row.
                 macro_rules! next_vis_row {
                     ($stdout:expr) => {{
-                        if cur_attr != (false, false) {
+                        if cur_attr != reset_attr {
                             queue!($stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
-                            cur_attr = (false, false);
+                            cur_attr = reset_attr;
                         }
                         vis_row += 1;
                         col_x = 0;
@@ -1150,61 +1492,40 @@ impl Editor {
                     let avail = tw.saturating_sub(col_x);
 
                     if !is_tab && avail > 0 && avail < w {
-                        // ── Wide char doesn't fit: pad → move to next row ─────
+                        // Wide char doesn't fit: pad → move to next row
                         let sel = self.in_selection(doc_row, char_idx);
-                        let na = (sel, false);
-                        if na != cur_attr {
-                            queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
-                            if sel { queue!(stdout, Print(crossterm::style::SetAttribute(Attribute::Reverse)))?; }
-                            cur_attr = na;
-                        }
-                        // Pad the rest of this row with spaces.
+                        let srch = self.search_attr_at(doc_row, char_idx);
+                        apply_attr!(stdout, &mut cur_attr, (sel, false, srch));
                         for _ in 0..avail { queue!(stdout, Print(' '))?; }
                         next_vis_row!(stdout);
                         if screen_row + vis_row < text_rows {
-                            // Render the wide char on the new row.
                             let sel2 = self.in_selection(doc_row, char_idx);
-                            let na2 = (sel2, false);
-                            if na2 != cur_attr {
-                                queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
-                                if sel2 { queue!(stdout, Print(crossterm::style::SetAttribute(Attribute::Reverse)))?; }
-                                cur_attr = na2;
-                            }
+                            let srch2 = self.search_attr_at(doc_row, char_idx);
+                            apply_attr!(stdout, &mut cur_attr, (sel2, false, srch2));
                             queue!(stdout, Print(ch))?;
                             col_x = w;
                         }
                     } else if col_x + w > tw {
-                        // ── Tab (or overflow) spans boundary: split as spaces ──
+                        // Tab (or overflow) spans boundary
                         let fits = avail;
                         let overflow = w - fits;
                         let sel = self.in_selection(doc_row, char_idx);
-                        let na = (sel, false);
-                        if na != cur_attr {
-                            queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
-                            if sel { queue!(stdout, Print(crossterm::style::SetAttribute(Attribute::Reverse)))?; }
-                            cur_attr = na;
-                        }
+                        let srch = self.search_attr_at(doc_row, char_idx);
+                        apply_attr!(stdout, &mut cur_attr, (sel, false, srch));
                         for _ in 0..fits { queue!(stdout, Print(' '))?; }
                         next_vis_row!(stdout);
                         if screen_row + vis_row < text_rows {
                             let sel2 = self.in_selection(doc_row, char_idx);
-                            if sel2 {
-                                queue!(stdout, Print(crossterm::style::SetAttribute(Attribute::Reverse)))?;
-                                cur_attr = (true, false);
-                            }
+                            let srch2 = self.search_attr_at(doc_row, char_idx);
+                            apply_attr!(stdout, &mut cur_attr, (sel2, false, srch2));
                             for _ in 0..overflow { queue!(stdout, Print(' '))?; }
                             col_x = overflow;
                         }
                     } else {
-                        // ── Normal: render in place ────────────────────────────
+                        // Normal: render in place
                         let sel = self.in_selection(doc_row, char_idx);
-                        let na = (sel, is_tab);
-                        if na != cur_attr {
-                            queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
-                            if sel { queue!(stdout, Print(crossterm::style::SetAttribute(Attribute::Reverse)))?; }
-                            if is_tab { queue!(stdout, SetForegroundColor(Color::DarkGrey))?; }
-                            cur_attr = na;
-                        }
+                        let srch = self.search_attr_at(doc_row, char_idx);
+                        apply_attr!(stdout, &mut cur_attr, (sel, is_tab, srch));
                         if is_tab {
                             queue!(stdout, Print('>'))?;
                             for _ in 1..w { queue!(stdout, Print(' '))?; }
@@ -1212,14 +1533,13 @@ impl Editor {
                             queue!(stdout, Print(ch))?;
                         }
                         col_x += w;
-                        // Exact boundary: clear next row eagerly for a tidy display.
                         if col_x == tw {
                             next_vis_row!(stdout);
                         }
                     }
                 }
 
-                if cur_attr != (false, false) {
+                if cur_attr != reset_attr {
                     queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
                 }
 
@@ -1227,7 +1547,7 @@ impl Editor {
                 doc_row += 1;
             }
         } else {
-            // ── Horizontal-scroll mode (original) ────────────────────────────
+            // ── Horizontal-scroll mode ────────────────────────────────────────
             for screen_row in 0..text_rows {
                 let doc_row = self.top + screen_row;
                 queue!(
@@ -1239,7 +1559,7 @@ impl Editor {
                 if doc_row < self.lines.len() {
                     let mut display_x: usize = 0;
                     let screen_w = self.term_cols as usize;
-                    let mut cur_attr: (bool, bool) = (false, false);
+                    let mut cur_attr: Attr = reset_attr;
 
                     for (char_idx, ch) in self.lines[doc_row].iter().enumerate() {
                         let is_tab = *ch == '\t';
@@ -1256,12 +1576,8 @@ impl Editor {
                         if display_x < self.left {
                             let visible_w = (display_x + w - self.left).min(screen_w);
                             let sel = self.in_selection(doc_row, char_idx);
-                            let new_attr = (sel, false);
-                            if new_attr != cur_attr {
-                                queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
-                                if sel { queue!(stdout, Print(crossterm::style::SetAttribute(Attribute::Reverse)))?; }
-                                cur_attr = new_attr;
-                            }
+                            let srch = self.search_attr_at(doc_row, char_idx);
+                            apply_attr!(stdout, &mut cur_attr, (sel, false, srch));
                             for _ in 0..visible_w { queue!(stdout, Print(' '))?; }
                             display_x += w;
                             continue;
@@ -1271,13 +1587,8 @@ impl Editor {
                         let avail = screen_w - screen_x;
 
                         let sel = self.in_selection(doc_row, char_idx);
-                        let new_attr = (sel, is_tab);
-                        if new_attr != cur_attr {
-                            queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
-                            if sel { queue!(stdout, Print(crossterm::style::SetAttribute(Attribute::Reverse)))?; }
-                            if is_tab { queue!(stdout, SetForegroundColor(Color::DarkGrey))?; }
-                            cur_attr = new_attr;
-                        }
+                        let srch = self.search_attr_at(doc_row, char_idx);
+                        apply_attr!(stdout, &mut cur_attr, (sel, is_tab, srch));
                         if is_tab {
                             let print_w = w.min(avail);
                             queue!(stdout, Print('>'))?;
@@ -1289,7 +1600,7 @@ impl Editor {
                         }
                         display_x += w;
                     }
-                    if cur_attr != (false, false) {
+                    if cur_attr != reset_attr {
                         queue!(stdout, ResetColor, Print(crossterm::style::SetAttribute(Attribute::Reset)))?;
                     }
                 } else {
@@ -1318,19 +1629,10 @@ impl Editor {
         let file_name = self
             .path
             .as_ref()
-            .map(|p| {
-                p.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
-            })
+            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
             .unwrap_or_else(|| "[New File]".into());
         let dirty = if self.modified { " [+]" } else { "" };
-        let enc_info = format!(
-            "{}  {}",
-            self.file_encoding.label(),
-            self.line_ending.label()
-        );
+        let enc_info = format!("{}  {}", self.file_encoding.label(), self.line_ending.label());
         let pos = format!(" {}:{} ", self.row + 1, self.col + 1);
         let left = format!(" {}{}  {}", file_name, dirty, enc_info);
         let pad = (self.term_cols as usize).saturating_sub(left.len() + pos.len());
@@ -1366,10 +1668,7 @@ impl Editor {
                     let (vrow, vcol) = self.wrap_render_pos(self.row, self.col);
                     (rows_before + vrow, vcol)
                 } else {
-                    (
-                        self.row - self.top,
-                        cursor_disp.saturating_sub(self.left),
-                    )
+                    (self.row - self.top, cursor_disp.saturating_sub(self.left))
                 };
                 queue!(
                     stdout,
@@ -1382,10 +1681,52 @@ impl Editor {
                     .iter()
                     .map(|c| c.width().unwrap_or(0) as u16)
                     .sum();
-                queue!(
-                    stdout,
-                    cursor::MoveTo(prefix_len + typed_width, self.term_rows - 1)
-                )?;
+                queue!(stdout, cursor::MoveTo(prefix_len + typed_width, self.term_rows - 1))?;
+            }
+            Prompt::Search { buf, cur } => {
+                let prefix_len = "Search: ".len() as u16;
+                let typed_width: u16 = buf[..*cur]
+                    .iter()
+                    .map(|c| c.width().unwrap_or(0) as u16)
+                    .sum();
+                queue!(stdout, cursor::MoveTo(prefix_len + typed_width, self.term_rows - 1))?;
+            }
+            Prompt::Replace { search_buf, replace_buf, search_cur, replace_cur, step } => {
+                let (prefix_str, buf, cur) = match step {
+                    ReplaceStep::SearchInput => {
+                        ("Replace — Search: ", search_buf as &Vec<char>, *search_cur)
+                    }
+                    ReplaceStep::ReplaceInput => {
+                        // prefix = "Replace \"<query>\" with: "
+                        // We compute the displayed prefix length from the status string.
+                        // Status is set to: Replace "<q>" with: <r>
+                        // cursor goes after the prefix, before replacement text.
+                        // We'll handle this case separately below.
+                        ("", replace_buf as &Vec<char>, *replace_cur)
+                    }
+                };
+                match step {
+                    ReplaceStep::SearchInput => {
+                        let prefix_len = prefix_str.len() as u16;
+                        let typed_width: u16 = buf[..cur]
+                            .iter()
+                            .map(|c| c.width().unwrap_or(0) as u16)
+                            .sum();
+                        queue!(stdout, cursor::MoveTo(prefix_len + typed_width, self.term_rows - 1))?;
+                    }
+                    ReplaceStep::ReplaceInput => {
+                        let q: String = search_buf.iter().collect();
+                        let prefix = format!("Replace \"{}\" with: ", q);
+                        let prefix_len: u16 = prefix.chars()
+                            .map(|c| c.width().unwrap_or(0) as u16)
+                            .sum();
+                        let typed_width: u16 = replace_buf[..*replace_cur]
+                            .iter()
+                            .map(|c| c.width().unwrap_or(0) as u16)
+                            .sum();
+                        queue!(stdout, cursor::MoveTo(prefix_len + typed_width, self.term_rows - 1))?;
+                    }
+                }
             }
         }
 
@@ -1436,10 +1777,7 @@ fn main() -> io::Result<()> {
                 if kind == KeyEventKind::Press || kind == KeyEventKind::Repeat =>
             {
                 if editor.handle_prompt_key(code, modifiers)? {
-                    // Key was consumed by the active prompt.
-                    if editor.pending_quit {
-                        break 'main;
-                    }
+                    if editor.pending_quit { break 'main; }
                 } else {
                     match (code, modifiers) {
                         // ── Quit ─────────────────────────────────────────────
@@ -1447,8 +1785,7 @@ fn main() -> io::Result<()> {
                             if editor.modified {
                                 editor.prompt = Prompt::QuitConfirm;
                                 editor.status =
-                                    "Unsaved changes!  [S]ave and quit  [N]o  [C]ancel"
-                                        .into();
+                                    "Unsaved changes!  [S]ave and quit  [U]nsave and quit  [C]ancel".into();
                             } else {
                                 break 'main;
                             }
@@ -1467,6 +1804,11 @@ fn main() -> io::Result<()> {
                             editor.undo();
                         }
 
+                        // ── Select All ───────────────────────────────────────
+                        (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
+                            editor.select_all();
+                        }
+
                         // ── Copy (Ctrl+C) ─────────────────────────────────────
                         (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             match editor.selection {
@@ -1477,8 +1819,7 @@ fn main() -> io::Result<()> {
                                         is_cut: false,
                                     });
                                     editor.status =
-                                        "Copy: move cursor to selection end, then Ctrl+C again."
-                                            .into();
+                                        "Copy: move cursor to selection end, then Ctrl+C again.".into();
                                 }
                                 Some(ref sel) if !sel.is_cut => {
                                     editor.clipboard = editor.collect_selected();
@@ -1489,8 +1830,7 @@ fn main() -> io::Result<()> {
                                 Some(ref mut sel) => {
                                     sel.is_cut = false;
                                     editor.status =
-                                        "Switched to copy mode. Press Ctrl+C again to copy."
-                                            .into();
+                                        "Switched to copy mode. Press Ctrl+C again to copy.".into();
                                 }
                             }
                         }
@@ -1505,8 +1845,7 @@ fn main() -> io::Result<()> {
                                         is_cut: true,
                                     });
                                     editor.status =
-                                        "Cut: move cursor to selection end, then Ctrl+X again."
-                                            .into();
+                                        "Cut: move cursor to selection end, then Ctrl+X again.".into();
                                 }
                                 Some(ref sel) if sel.is_cut => {
                                     editor.clipboard = editor.collect_selected();
@@ -1517,8 +1856,7 @@ fn main() -> io::Result<()> {
                                 Some(ref mut sel) => {
                                     sel.is_cut = true;
                                     editor.status =
-                                        "Switched to cut mode. Press Ctrl+X again to cut."
-                                            .into();
+                                        "Switched to cut mode. Press Ctrl+X again to cut.".into();
                                 }
                             }
                         }
@@ -1538,8 +1876,37 @@ fn main() -> io::Result<()> {
                             );
                         }
 
-                        // ── Word wrap toggle ──────────────────────────────────
+                        // ── Search (Ctrl+F) ───────────────────────────────────
                         (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                            // Pre-fill with previous query if any
+                            let prefill = editor.search_query.clone();
+                            let cur = prefill.len();
+                            editor.prompt = Prompt::Search { buf: prefill, cur };
+                            editor.update_search();
+                            if !editor.search_matches.is_empty() {
+                                let idx = editor.find_nearest_match_from(editor.row, editor.col);
+                                editor.jump_to_match(idx);
+                            }
+                            editor.status = editor.search_status();
+                        }
+
+                        // ── Replace (Ctrl+R) ──────────────────────────────────
+                        (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                            let prefill = editor.search_query.clone();
+                            let cur = prefill.len();
+                            editor.prompt = Prompt::Replace {
+                                search_buf: prefill,
+                                replace_buf: vec![],
+                                search_cur: cur,
+                                replace_cur: 0,
+                                step: ReplaceStep::SearchInput,
+                            };
+                            editor.update_search();
+                            editor.update_replace_status();
+                        }
+
+                        // ── Word wrap toggle (Ctrl+B) ─────────────────────────
+                        (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
                             editor.word_wrap = !editor.word_wrap;
                             editor.left = 0;
                             editor.status = if editor.word_wrap {
